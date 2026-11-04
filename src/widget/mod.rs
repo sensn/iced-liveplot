@@ -98,6 +98,10 @@ impl Program {
         self.plot.borrow()
     }
 
+
+  pub fn clear_cache(&self) {
+        self.cache.clear();
+    }
     /// Mutable access to the plot model. Invalidates the geometry cache.
     ///
     /// The closure must not call other `Program` methods that borrow the plot.

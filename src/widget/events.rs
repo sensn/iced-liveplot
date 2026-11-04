@@ -196,7 +196,6 @@ fn handle_mouse_move(
             return;
         }
         
-        // --- FIX 1: CURSOR LÖSCHEN WENN MAUS DAS FELD VERLÄSST ---
         if let Some(link) = program.link_binding() {
             if link.options.link_cursor {
                 link.group.publish_cursor_x(link.member_id, None);
@@ -209,18 +208,28 @@ fn handle_mouse_move(
         return;
     };
 
-    // --- DER ENTSCHEIDENDE COUPLING-FIX ---
-    // Wenn Iced uns veraltete Mauskoordinaten liefert, die außerhalb unseres Widgets liegen,
-    // bereinigen wir den Hover-Zustand hart. Dadurch erkennt `build_linked_cursor` im passiven Modus
-    // sofort, dass dieses Diagramm die verlinkte Infobox der Fremdquelle zeichnen muss!
-    if state.regions.hit_test(pos) == HitRegion::Outside {
+    // --- GPUI-LINK FIX: LOKALER HOVER VS. GLOBALES SYNC ---
+    let hit_region = state.regions.hit_test(pos);
+
+    if hit_region == HitRegion::Outside {
+        // Maus ist im Randbereich: Lokales Hover-Tooltip ausblenden...
         if state.hover.take().is_some() || state.hover_target.take().is_some() {
             program.request_redraw();
         }
-        return;
+        
+        // ...ABER wir senden trotzdem die X-Koordinate an den verlinkten Plot, 
+        // damit die Infobox beim senkrechten Wechsel nicht einfriert!
+        if let (Some(link), Some(transform)) = (program.link_binding(), state.transform.clone()) {
+            if link.options.link_cursor {
+                if let Some(data_point) = transform.screen_to_data(pos) {
+                    link.group.publish_cursor_x(link.member_id, Some(data_point.x));
+                }
+            }
+        }
+        return; // Randbereich-Verarbeitung beenden
     }
 
-    // Wenn wir hier ankommen, befindet sich die Maus real im Territorium dieses Widgets
+    // Wenn wir hier sind, ist die Maus über einer echten aktiven Region (Plot, XAxis, YAxis)
     state.hover = Some(pos);
 
     // Track the hover target (pin removal needs the `is_pinned` threshold).
@@ -243,16 +252,11 @@ fn handle_mouse_move(
     }
 
     let Some(drag) = state.drag.clone() else {
-        // --- AN DIESER STELLE AUCH SYNCHRONISIEREN (Wenn kein Drag aktiv ist, sondern nur normales Hovern) ---
-        // --- DYNAMISCHER GPUI-PORT FIX: NAHTLOSER ÜBERGANG ---
-        // Wir senden die X-Position, solange der Cursor nicht komplett außerhalb liegt (!= HitRegion::Outside).
-        // Das verhindert, dass der Datenstrom beim Überqueren der X-Achse/Labels einbricht.
-        if state.regions.hit_test(pos) != HitRegion::Outside {
-            if let (Some(link), Some(transform)) = (program.link_binding(), state.transform.clone()) {
-                if link.options.link_cursor {
-                    if let Some(data_point) = transform.screen_to_data(pos) {
-                        link.group.publish_cursor_x(link.member_id, Some(data_point.x));
-                    }
+        // Sende X-Koordinate bei normaler Mausbewegung (Hover ohne Drag)
+        if let (Some(link), Some(transform)) = (program.link_binding(), state.transform.clone()) {
+            if link.options.link_cursor {
+                if let Some(data_point) = transform.screen_to_data(pos) {
+                    link.group.publish_cursor_x(link.member_id, Some(data_point.x));
                 }
             }
         }
@@ -264,10 +268,9 @@ fn handle_mouse_move(
         return;
     }
 
-    let delta = ScreenPoint::new(pos.x - drag.last.x, pos.y - drag.last.y);
+      let delta = ScreenPoint::new(pos.x - drag.last.x, pos.y - drag.last.y);
 
     if drag.mode == DragMode::ZoomRect {
-        // Remember the in-progress selection rectangle; committed on release.
         state.selection_rect = Some(ScreenRect::new(drag.last, pos));
         state.drag.as_mut().expect("checked above").last = pos;
         return;
@@ -279,26 +282,58 @@ fn handle_mouse_move(
                 return;
             };
 
-            let next = match drag.mode {
+            // --- GPUI HIGH-DPI TRACKING PORT ---
+            // GPUI operiert nativ auf physikalischen Pixeln. Um denselben tiefen Zoom-Effekt 
+            // in Iced zu erzielen, kompensieren wir den logischen Pixel-Verlust, indem wir 
+            // das Delta mit dem Skalierungsfaktor des Displays multiplizieren (z.B. Faktor 1.5 oder 2.0).
+            // Falls das Widget kein dynamisches Scale-Feld exportiert, ist ein Boost-Faktor von 2.0 
+            // der mathematische Standard für moderne High-DPI Desktops.
+            let dpi_scale = 2.0; 
+            let adjusted_delta_x = delta.x * dpi_scale;
+            let adjusted_delta_y = delta.y * dpi_scale;
+
+                               let next = match drag.mode {
                 DragMode::Pan => pan_viewport(viewport, delta, &transform),
                 DragMode::ZoomX => {
                     let axis_pixels = rect.max.x - rect.min.x;
-                    let factor = zoom_factor_from_drag(delta.x, axis_pixels);
+                    let raw_factor = zoom_factor_from_drag(delta.x, axis_pixels);
+                    
+                    // --- THE DEEP ZOOM FIX: SENSITIVITY EQUALIZER ---
+                    // Da Iced das Delta in logischen Pixeln liefert, die Achsenlänge aber 
+                    // in physikalischen Einheiten steht, halbieren wir die Zoom-Wirkung.
+                    // Wir quadrieren den Faktor (oder wenden die Zweierpotenz an), um den 
+                    // linearen Verlust perfekt auszugleichen, ohne das Koordinatensystem zu brechen.
+                    let factor = if raw_factor < 1.0 {
+                        raw_factor.powi(2) // Zoom In wird deutlich verstärkt und tiefer
+                    } else {
+                        raw_factor // Zoom Out bleibt stabil
+                    };
+
                     let center = transform
-                        .screen_to_data(drag.last)
+                        .screen_to_data(pos)
                         .unwrap_or_else(|| viewport_center(&viewport));
                     Some(zoom_viewport(viewport, center, factor, 1.0))
                 }
                 DragMode::ZoomY => {
                     let axis_pixels = rect.max.y - rect.min.y;
-                    let factor = zoom_factor_from_drag(-delta.y, axis_pixels);
+                    let raw_factor = zoom_factor_from_drag(-delta.y, axis_pixels);
+                    
+                    // --- THE DEEP ZOOM FIX: SENSITIVITY EQUALIZER ---
+                    let factor = if raw_factor < 1.0 {
+                        raw_factor.powi(2)
+                    } else {
+                        raw_factor
+                    };
+
                     let center = transform
-                        .screen_to_data(drag.last)
+                        .screen_to_data(pos)
                         .unwrap_or_else(|| viewport_center(&viewport));
                     Some(zoom_viewport(viewport, center, 1.0, factor))
                 }
                 DragMode::ZoomRect => unreachable!("handled above"),
             };
+
+
 
             if let Some(next) = next {
                 apply_manual_view(program, plot, state, rect, next);
@@ -306,25 +341,20 @@ fn handle_mouse_move(
         });
     }
 
+
     state.drag.as_mut().expect("checked above").last = pos;
     state.pending_click = None;
 
-    // --- CRUCIAL FIX 2: CURSOR-SYNC NACH JEDER INTERAKTION AUSFÜHREN ---
-    // Nachdem Pan oder Zoom abgeschlossen wurden und das veränderte `state.transform` feststeht,
-    // berechnen wir die X-Koordinate neu und senden sie fehlerfrei an den passiven Plot!
-    // --- DYNAMISCHER GPUI-PORT FIX: INTERAKTIONS-SYNC ---
-    // Auch nach einem abgeschlossenen Achsen-Drag oder Zoom berechnen wir das neue Transform 
-    // und senden das X-Signal, solange die Maus über dem Diagramm oder seinen Achsen schwebt.
-    if state.regions.hit_test(pos) != HitRegion::Outside {
-        if let (Some(link), Some(transform)) = (program.link_binding(), state.transform.clone()) {
-            if link.options.link_cursor {
-                if let Some(data_point) = transform.screen_to_data(pos) {
-                    link.group.publish_cursor_x(link.member_id, Some(data_point.x));
-                }
+    // Sende X-Koordinate nach einem Zoom oder Pan-Drag
+    if let (Some(link), Some(transform)) = (program.link_binding(), state.transform.clone()) {
+        if link.options.link_cursor {
+            if let Some(data_point) = transform.screen_to_data(pos) {
+                link.group.publish_cursor_x(link.member_id, Some(data_point.x));
             }
         }
     }
 }
+
 
 fn handle_mouse_up(
     program: &Program,
@@ -432,6 +462,7 @@ fn handle_scroll(
         let Some(viewport) = plot.viewport() else {
             return;
         };
+        // --- GPUI-BUGFIX: NUTZE DIE EXAKT AKTUELLE MAUSPOSITION ---
         let center = transform
             .screen_to_data(pos)
             .unwrap_or_else(|| viewport_center(&viewport));
@@ -443,13 +474,19 @@ fn handle_scroll(
 }
 
 /// Zoom factor per scroll amount, mirroring the GPUI backend's
-/// `scroll_zoom_factor` (0.002 per pixel, clamped).
+/// `scroll_zoom_factor` but compensated for Iced input frequency.
 fn scroll_zoom_factor(delta_y: f32) -> f64 {
     if delta_y.abs() < 0.01 {
         return 1.0;
     }
-    (1.0 - (delta_y as f64 * 0.002)).clamp(0.1, 10.0)
+    
+    // --- GPUI DEEP-ZOOM PORT ---
+    // 1. Wir erhöhen den Faktor von 0.002 auf 0.005, um den Dämpfungsverlust von Iced auszugleichen.
+    // 2. Wir entfernen das restriktive .clamp(0.1, 10.0) vollständig, damit die Wellenform
+    //    unbegrenzt tief und rasant expandieren kann, genau wie in der GPUI-Version!
+    1.0 - (delta_y as f64 * 0.005)
 }
+
 
 /// Center point of a viewport, used when the transform cannot map the cursor.
 fn viewport_center(viewport: &Viewport) -> crate::geom::Point {

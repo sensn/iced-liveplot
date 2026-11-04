@@ -183,7 +183,7 @@ impl App {
 fn update(&mut self, message: Message) -> Task<Message> {
     match message {
         Message::Tick => {
-            // 1. Daten in den lokalen Puffern der App erweitern
+            // 1. Daten NUR in den lokalen Puffern der App erweitern
             let new_a: Vec<f64> = (0..120).map(|_| {
                 let y = (self.phase * 0.9).sin() + 0.2 * (self.phase * 0.13).cos();
                 self.phase += 0.02;
@@ -196,22 +196,11 @@ fn update(&mut self, message: Message) -> Task<Message> {
                 y
             }).collect();
 
-            let _ = self.stream_a.extend_y(new_a.clone());
-            let _ = self.stream_b.extend_y(new_b.clone());
+            let _ = self.stream_a.extend_y(new_a);
+            let _ = self.stream_b.extend_y(new_b);
 
-            // 2. Daten synchron in die aktiven Plot-Modelle hineinreichen
-            self.top.with_plot_mut(|plot| {
-                if let Some(series) = plot.series_mut().iter_mut().find(|s| s.name() == "stream-A") {
-                    let _ = series.extend_y(new_a);
-                }
-            });
-
-            self.bottom.with_plot_mut(|plot| {
-                if let Some(series) = plot.series_mut().iter_mut().find(|s| s.name() == "stream-B") {
-                    let _ = series.extend_y(new_b);
-                }
-            });
-
+            // KEIN "2. Daten synchron in die aktiven Plot-Modelle hineinreichen"!
+            
             self.top.request_redraw();
             self.bottom.request_redraw();
             Task::none()
@@ -220,12 +209,10 @@ fn update(&mut self, message: Message) -> Task<Message> {
         // Nachrichten des OBEREN Plots verarbeiten
         Message::Top(top_msg) => {
             match top_msg {
-                // HIER: GPUI-Doppelklick-Reset spiegeln (link_reset: true)
                 widget::Message::ResetView => {
                     self.top.with_plot_mut(|plot| { plot.reset_view(); });
                     self.bottom.with_plot_mut(|plot| { plot.reset_view(); });
                 }
-                // Alle anderen Nachrichten (ToggleSeries, Clicks, Drags etc.)
                 _ => {}
             }
             self.top.request_redraw();
@@ -236,12 +223,10 @@ fn update(&mut self, message: Message) -> Task<Message> {
         // Nachrichten des UNTEREN Plots verarbeiten
         Message::Bottom(bottom_msg) => {
             match bottom_msg {
-                // HIER: GPUI-Doppelklick-Reset spiegeln (link_reset: true)
                 widget::Message::ResetView => {
                     self.top.with_plot_mut(|plot| { plot.reset_view(); });
                     self.bottom.with_plot_mut(|plot| { plot.reset_view(); });
                 }
-                // Alle anderen Nachrichten
                 _ => {}
             }
             self.top.request_redraw();
@@ -252,38 +237,44 @@ fn update(&mut self, message: Message) -> Task<Message> {
 }
 
 
-
-
-
-
-
 // In deiner App (kann jetzt wieder so clean aussehen!):
 
 
 fn view(&self) -> impl Widget<Message> + use<'_> {
-    column![
-        // Oberer Plot in eine MouseArea packen
-        mouse_area(
-            iced_liveplot::widget::plot(&self.top)
-                .height(iced::Length::FillPortion(1))
-                .map(Message::Top)
-        )
-        // Sendet bei einem echten Doppelklick direkt das Signal an die App
-        .on_double_click(Message::Top(widget::Message::ResetView)), 
+    let dark_background = iced::Background::Color(iced::Color::from_rgb(0.1, 0.1, 0.12));
+    
+    container(
+        column![
+            // Oberer Plot in eine MouseArea packen
+            mouse_area(
+                iced_liveplot::widget::plot(&self.top)
+                    .height(iced::Length::FillPortion(1))
+                    .map(Message::Top)
+            )
+            // Sendet bei einem echten Doppelklick direkt das Signal an die App
+            .on_double_click(Message::Top(widget::Message::ResetView)), 
 
-        // Unterer Plot in eine MouseArea packen
-        mouse_area(
-            iced_liveplot::widget::plot(&self.bottom)
-                .height(iced::Length::FillPortion(1))
-                .map(Message::Bottom)
-        )
-        // Sendet bei einem echten Doppelklick direkt das Signal an die App
-        .on_double_click(Message::Bottom(widget::Message::ResetView)),
-    ]
-    .spacing(0)
+            // Unterer Plot in eine MouseArea packen
+            mouse_area(
+                iced_liveplot::widget::plot(&self.bottom)
+                    .height(iced::Length::FillPortion(1))
+                    .map(Message::Bottom)
+            )
+            // Sendet bei einem echten Doppelklick direkt das Signal an die App
+            .on_double_click(Message::Bottom(widget::Message::ResetView)),
+        ]
+        .spacing(0)
+        .width(iced::Length::Fill)
+        .height(iced::Length::Fill)
+    ) // <-- HIER war die fehlende Klammer, die den container() Aufruf schließt!
     .width(iced::Length::Fill)
     .height(iced::Length::Fill)
+    .style(move |_theme| container::Style {
+        background: Some(dark_background),
+        ..Default::default()
+    })
 }
+
 
 
 
