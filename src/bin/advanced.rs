@@ -53,8 +53,32 @@ struct App {
 
 impl App {
     fn new() -> (Self, Task<Message>) {
-        let mut stream_a = Series::line("stream-A");
-        let mut stream_b = Series::line("stream-B");
+        //let mut stream_a = Series::line("stream-A");
+        //let mut stream_b = Series::line("stream-B");
+        
+         // 1. Initialisiere Stream A mit dem originalen Teal-Farbton
+    let mut stream_a = Series::line("stream-A").with_kind(SeriesKind::Line(LineStyle {
+        color: iced::Color {
+            r: 0.2,
+            g: 0.82,
+            b: 0.95,
+            a: 1.0,
+        },
+        width: 2.0,
+    }));
+
+    // 2. Initialisiere Stream B mit dem originalen Orange-Farbton
+    let mut stream_b = Series::line("stream-B").with_kind(SeriesKind::Line(LineStyle {
+        color: iced::Color {
+            r: 0.95,
+            g: 0.64,
+            b: 0.28,
+            a: 1.0,
+        },
+        width: 2.0,
+    }));
+
+
 
         for i in 0..1_000 {
             let phase = i as f64 * 0.02;

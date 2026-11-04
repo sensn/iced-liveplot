@@ -254,7 +254,7 @@ fn handle_mouse_move(
 fn handle_mouse_up(
     program: &Program,
     state: &mut PlotUiState,
-    _button: mouse::Button,
+    button: mouse::Button, // HIER: Unterstrich entfernt, wir brauchen den Button!
     position: Option<ScreenPoint>,
 ) {
     let drag = state.drag.take();
@@ -277,14 +277,11 @@ fn handle_mouse_up(
         }
     }
 
-    // A left click (no meaningful drag) toggles a pin at the cursor, like the
-    // GPUI backend's click handling.
-    let was_click = click
-        .as_ref()
-        .is_some_and(|click| {
-            click.button == mouse::Button::Left && click.region == HitRegion::Plot
-        })
-        && drag.as_ref().is_none_or(|drag| !drag.active);
+    // --- GEFIXTE DOPPEL-INTERAKTIONS LOGIK FÜR PIN/MARKER ---
+    // Ein Klick zählt, wenn der linke Knopf losgelassen wird und wir nicht in einem Box-Zoom-Modus waren.
+    // Das umschifft das vorzeitige Löschen von `pending_click` während minimaler Mausbewegungen.
+    let was_click = button == mouse::Button::Left 
+        && drag.as_ref().is_none_or(|d| d.mode != DragMode::ZoomRect);
 
     if was_click {
         if let (Some(pos), Some(transform)) = (position, state.transform.clone()) {
