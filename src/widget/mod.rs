@@ -23,8 +23,11 @@ use iced::Rectangle;
 use crate::plot::Plot;
 use crate::style::Theme;
 
-use config::PlotViewConfig;
+pub use config::PlotViewConfig;
 use state::PlotUiState;
+// linking
+use crate::widget::link::PlotLinkOptions;
+use crate::widget::link::{PlotLinkGroup, LinkBinding};
 
 /// A message produced by the plot widget.
 #[derive(Debug, Clone)]
@@ -49,6 +52,7 @@ pub struct Program {
     theme: RefCell<Theme>,
     config: PlotViewConfig,
     cache: Cache,
+    link_binding: Option<LinkBinding>, // HIER ERGÄNZEN: Das Binding für die Synchronisation
 }
 
 impl Program {
@@ -58,8 +62,36 @@ impl Program {
             theme: RefCell::new(Theme::default()),
             config: PlotViewConfig::default(),
             cache: Cache::new(),
+            link_binding: None, // Initial leer
         }
     }
+    
+    /// Getter für das Link-Binding (wird in events.rs gebraucht)
+    pub fn link_binding(&self) -> Option<&LinkBinding> {
+        self.link_binding.as_ref()
+    }
+
+    /// Setzt die Konfiguration im Builder-Stil
+    pub fn with_config(mut self, config: PlotViewConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// Registriert das Programm in der Link-Gruppe und gibt das verlinkte Programm zurück
+    pub fn with_link_group(mut self, group: PlotLinkGroup, options: PlotLinkOptions) -> Self {
+    // Da LinkBinding privat ist, erzeugen wir es hier direkt intern, 
+    // falls Program es als Feld hält, oder wir nutzen einfach die pub-Methoden der Gruppe:
+    let member_id = group.register_member();
+    
+    // Wenn dein struct Program ein internes link_binding-Feld hat, 
+    // nutze den voll-qualifizierten Pfad innerhalb der Lib:
+    self.link_binding = Some(crate::widget::link::LinkBinding {
+        group,
+        member_id,
+        options,
+    });
+    self
+}
 
     /// Immutable access to the plot model.
     pub fn plot(&self) -> std::cell::Ref<'_, Plot> {

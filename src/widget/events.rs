@@ -74,6 +74,37 @@ pub(super) fn handle(
 fn refresh_layout(program: &Program, state: &mut PlotUiState, bounds: Rectangle) {
     let mut scratch = state.clone();
     let config = program.config().clone();
+    
+    // --- GPUI-LINK-PORT: Empfange Updates vom verlinkten Plot ---
+    if let Some(link) = program.link_binding() {
+        if let Some(update) = link.group.latest_view_update() {
+            // Nur reagieren, wenn das Update von einem ANDEREN Plot stammt und eine neuere Sequenz hat
+            if update.source != link.member_id && update.seq > state.link_view_seq {
+                program.with_plot_mut(|plot| {
+                    match update.kind {
+                        crate::widget::link::ViewSyncKind::Manual { viewport, sync_x, sync_y } => {
+                            if let Some(current) = plot.viewport() {
+                                let mut next = current;
+                                // Übernehme die Koordinaten basierend auf den erlaubten Optionen
+                                if link.options.link_x && sync_x { next.x = viewport.x; }
+                                if link.options.link_y && sync_y { next.y = viewport.y; }
+                                plot.set_manual_view(next);
+                                scratch.viewport = Some(next);
+                            }
+                        }
+                        crate::widget::link::ViewSyncKind::Reset => {
+                            if link.options.link_reset {
+                                plot.reset_view();
+                                scratch.viewport = None;
+                            }
+                        }
+                    }
+                });
+                state.link_view_seq = update.seq; // Lokale Sequenz updaten
+            }
+        }
+    }
+
     // `build_frame` also refreshes the plot's live viewport.
     program.with_plot_mut(|plot| {
         let _frame = super::frame::build_frame(plot, &mut scratch, &config, bounds);
@@ -87,6 +118,7 @@ fn refresh_layout(program: &Program, state: &mut PlotUiState, bounds: Rectangle)
     state.y_layout = scratch.y_layout;
     state.legend_layout = scratch.legend_layout;
 }
+
 
 fn handle_mouse_down(
     program: &Program,
@@ -374,5 +406,22 @@ fn apply_manual_view(
     if let Some(transform) = crate::transform::Transform::new(viewport, rect) {
         state.transform = Some(transform);
     }
+
+    // --- GPUI-LINK-PORT: Sende das neue Layout an die Gruppe ---
+    if let Some(link) = program.link_binding() {
+        // Wir publizieren den neuen Viewport. 
+        // link_x und link_y steuern, welche Achsen synchronisiert werden sollen.
+        link.group.publish_manual_view(
+            link.member_id,
+            viewport,
+            link.options.link_x,
+            link.options.link_y,
+        );
+        // Wir aktualisieren direkt unsere eigene Sequenz, damit wir das Event nicht selbst spiegeln
+        if let Some(update) = link.group.latest_view_update() {
+            state.link_view_seq = update.seq;
+        }
+    }
+
     program.request_redraw();
 }

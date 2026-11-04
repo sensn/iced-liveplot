@@ -20,6 +20,11 @@ use iced_liveplot::view::View;
 use iced_liveplot::widget::{self, Program};
 use iced_liveplot::{Plot, Range};
 
+// In src/bin/advanced.rs:
+use iced_liveplot::widget::PlotViewConfig; 
+use iced_liveplot::widget::link::{PlotLinkGroup, PlotLinkOptions}; // KEIN LinkBinding hier!
+
+
 fn main() -> iced::Result {
     iced::application(App::new, App::update, App::view)
         .title("advanced — iced-liveplot")
@@ -113,11 +118,36 @@ impl App {
             .build();
         bottom_plot.add_series(&stream_b);
         bottom_plot.add_series(&baseline);
+        
+         let config = PlotViewConfig {
+        show_legend: true,
+        show_hover: true,
+        ..Default::default()
+    };
 
+    let link_group = PlotLinkGroup::new();
+    let options = PlotLinkOptions {
+        link_x: true,
+        link_y: false,
+        link_cursor: true,
+        link_brush: true,
+        link_reset: true,
+    };
+
+      // 2. Kette die Builder-Methoden an die Widgets
+        let top_program = Program::new(top_plot)
+            .with_config(config.clone())
+            .with_link_group(link_group.clone(), options);
+
+        let bottom_program = Program::new(bottom_plot)
+            .with_config(config)
+            .with_link_group(link_group, options);
+
+        // 3. Setze die Variablen direkt in den Self-Block ein
         (
             Self {
-                top: Program::new(top_plot),
-                bottom: Program::new(bottom_plot),
+                top: top_program,       // Nutzt das fertig verlinkte Top-Widget
+                bottom: bottom_program, // Nutzt das fertig verlinkte Bottom-Widget
                 stream_a,
                 stream_b,
                 phase: 0.0,
