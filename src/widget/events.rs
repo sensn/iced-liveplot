@@ -75,6 +75,28 @@ fn refresh_layout(program: &Program, state: &mut PlotUiState, bounds: Rectangle)
     let mut scratch = state.clone();
     let config = program.config().clone();
     
+    // --- BUGHUNT: STABILES CURSOR-LINKING BEI INTERAKTIONEN ---
+    if let Some(link) = program.link_binding() {
+        if link.options.link_cursor {
+            if let Some(cursor_update) = link.group.latest_cursor_update() {
+                // Wenn das Update von einem ANDEREN Plot stammt:
+                if cursor_update.source != link.member_id {
+                    // FIX: Wir schreiben den X-Wert in BEIDE Zustände (state und scratch)!
+                    // Dadurch geht der Wert beim nachfolgenden Zuweisen am Ende nicht verloren
+                    // und steht build_frame/build_linked_cursor sofort zur Verfügung.
+                    state.linked_cursor_x = cursor_update.x;
+                    scratch.linked_cursor_x = cursor_update.x;
+                    
+                    if cursor_update.seq > state.link_cursor_seq {
+                        state.link_cursor_seq = cursor_update.seq;
+                        scratch.link_cursor_seq = cursor_update.seq;
+                        program.request_redraw();
+                    }
+                }
+            }
+        }
+    }
+    
     // --- GPUI-LINK-PORT: Empfange Updates vom verlinkten Plot ---
     if let Some(link) = program.link_binding() {
         if let Some(update) = link.group.latest_view_update() {
@@ -101,6 +123,7 @@ fn refresh_layout(program: &Program, state: &mut PlotUiState, bounds: Rectangle)
                     }
                 });
                 state.link_view_seq = update.seq; // Lokale Sequenz updaten
+                scratch.link_view_seq = update.seq;
             }
         }
     }
@@ -117,8 +140,10 @@ fn refresh_layout(program: &Program, state: &mut PlotUiState, bounds: Rectangle)
     state.x_layout = scratch.x_layout;
     state.y_layout = scratch.y_layout;
     state.legend_layout = scratch.legend_layout;
+    
+    // HIER: Wir stellen sicher, dass der verlinkte Cursor-Fokus permanent erhalten bleibt
+    state.linked_cursor_x = scratch.linked_cursor_x;
 }
-
 
 fn handle_mouse_down(
     program: &Program,
@@ -170,12 +195,32 @@ fn handle_mouse_move(
         if still_inside {
             return;
         }
+        
+        // --- FIX 1: CURSOR LÖSCHEN WENN MAUS DAS FELD VERLÄSST ---
+        if let Some(link) = program.link_binding() {
+            if link.options.link_cursor {
+                link.group.publish_cursor_x(link.member_id, None);
+            }
+        }
+
         if state.hover.take().is_some() || state.hover_target.take().is_some() {
             program.request_redraw();
         }
         return;
     };
 
+    // --- DER ENTSCHEIDENDE COUPLING-FIX ---
+    // Wenn Iced uns veraltete Mauskoordinaten liefert, die außerhalb unseres Widgets liegen,
+    // bereinigen wir den Hover-Zustand hart. Dadurch erkennt `build_linked_cursor` im passiven Modus
+    // sofort, dass dieses Diagramm die verlinkte Infobox der Fremdquelle zeichnen muss!
+    if state.regions.hit_test(pos) == HitRegion::Outside {
+        if state.hover.take().is_some() || state.hover_target.take().is_some() {
+            program.request_redraw();
+        }
+        return;
+    }
+
+    // Wenn wir hier ankommen, befindet sich die Maus real im Territorium dieses Widgets
     state.hover = Some(pos);
 
     // Track the hover target (pin removal needs the `is_pinned` threshold).
@@ -198,8 +243,22 @@ fn handle_mouse_move(
     }
 
     let Some(drag) = state.drag.clone() else {
+        // --- AN DIESER STELLE AUCH SYNCHRONISIEREN (Wenn kein Drag aktiv ist, sondern nur normales Hovern) ---
+        // --- DYNAMISCHER GPUI-PORT FIX: NAHTLOSER ÜBERGANG ---
+        // Wir senden die X-Position, solange der Cursor nicht komplett außerhalb liegt (!= HitRegion::Outside).
+        // Das verhindert, dass der Datenstrom beim Überqueren der X-Achse/Labels einbricht.
+        if state.regions.hit_test(pos) != HitRegion::Outside {
+            if let (Some(link), Some(transform)) = (program.link_binding(), state.transform.clone()) {
+                if link.options.link_cursor {
+                    if let Some(data_point) = transform.screen_to_data(pos) {
+                        link.group.publish_cursor_x(link.member_id, Some(data_point.x));
+                    }
+                }
+            }
+        }
         return;
     };
+    
     if !drag.active {
         state.pending_click = None;
         return;
@@ -249,6 +308,22 @@ fn handle_mouse_move(
 
     state.drag.as_mut().expect("checked above").last = pos;
     state.pending_click = None;
+
+    // --- CRUCIAL FIX 2: CURSOR-SYNC NACH JEDER INTERAKTION AUSFÜHREN ---
+    // Nachdem Pan oder Zoom abgeschlossen wurden und das veränderte `state.transform` feststeht,
+    // berechnen wir die X-Koordinate neu und senden sie fehlerfrei an den passiven Plot!
+    // --- DYNAMISCHER GPUI-PORT FIX: INTERAKTIONS-SYNC ---
+    // Auch nach einem abgeschlossenen Achsen-Drag oder Zoom berechnen wir das neue Transform 
+    // und senden das X-Signal, solange die Maus über dem Diagramm oder seinen Achsen schwebt.
+    if state.regions.hit_test(pos) != HitRegion::Outside {
+        if let (Some(link), Some(transform)) = (program.link_binding(), state.transform.clone()) {
+            if link.options.link_cursor {
+                if let Some(data_point) = transform.screen_to_data(pos) {
+                    link.group.publish_cursor_x(link.member_id, Some(data_point.x));
+                }
+            }
+        }
+    }
 }
 
 fn handle_mouse_up(

@@ -7,7 +7,7 @@
 
 //use iced::widget::text;
 use iced::{Subscription, Task, Widget};
-use iced::Renderer;
+//use iced::Renderer;
  // use iced::widget::container;
   use iced::widget::{container, column};
 //use iced::Color;
@@ -20,7 +20,7 @@ use iced_liveplot::view::View;
 use iced_liveplot::widget::{self, Program};
 use iced_liveplot::{Plot, Range};
 
-// In src/bin/advanced.rs:
+// Linking plots
 use iced_liveplot::widget::PlotViewConfig; 
 use iced_liveplot::widget::link::{PlotLinkGroup, PlotLinkOptions}; // KEIN LinkBinding hier!
 

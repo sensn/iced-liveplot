@@ -400,8 +400,8 @@ fn build_pins(
     }
 
     let theme = plot.theme();
-    let font_size = 12.0;
-    let line_height = 14.0;
+      let font_size = LEGEND_FONT_SIZE;
+    let line_height = LEGEND_LINE_HEIGHT;
     let mut labels: Vec<PinLabel> = Vec::new();
     render.push(RenderCommand::ClipRect(plot_rect));
 
@@ -533,9 +533,13 @@ fn build_pins(
                 }
             }
 
-            let center = cluster_center(&labels, &cluster);
+                let center = cluster_center(&labels, &cluster);
             let label = format!("{} pins", cluster.len());
-            let size = measurer.measure(&label, font_size);
+            
+            // --- GPUI-PORT FIX: COMPACT CLUSTER BOX (1 Zeile) ---
+            // Nutzt ein passendes Tupel (Breite, Höhe) für den kurzen Text
+            let size = (65.0, 20.0);
+            
             if let Some((origin, rect)) =
                 place_label(center, size, plot_rect, PIN_LABEL_OFFSET, &placed)
             {
@@ -559,9 +563,26 @@ fn build_pins(
         }
         let index = cluster[0];
         let entry = &labels[index];
+        
+       // --- DER FIX: DYNAMISCHE HÖHE DIREKT AN DER QUELLE ---
+        // Deine Formel für die Zeilenhöhe: font_size + (font_size / 3.0)
+        let dynamic_line_height = font_size + (font_size / 3.0);
+        
+        // Zähle, wie viele Zeilen der Text tatsächlich hat (meistens 2)
+        let line_count = entry.label.lines().count() as f32;
+        
+        // Berechne die exakte Höhe: (Zeilen * Zeilenhöhe) + vertikales Padding (z.B. 6.0px)
+        let dynamic_box_height = (line_count * dynamic_line_height) + 6.0;
+        
+        // Berechne die Breite proportional zur Schriftgröße (z.B. font_size * 7.5)
+        let dynamic_box_width = font_size * 7.5;
+
+        // Das berechnete dynamische Tupel für place_label
+        let size = (dynamic_box_width, dynamic_box_height);
+
         if let Some((origin, rect)) = place_label(
             entry.screen,
-            entry.size,
+            size, // Übergibt das mathematisch korrekte Tupel!
             plot_rect,
             PIN_LABEL_OFFSET,
             &placed,
@@ -574,7 +595,7 @@ fn build_pins(
                 entry.screen,
                 &entry.label,
                 font_size,
-                line_height,
+                dynamic_line_height, // Gibt die dynamische Zeilenhöhe weiter
                 theme,
             );
             single_budget = single_budget.saturating_sub(1);
@@ -583,6 +604,7 @@ fn build_pins(
 
     render.push(RenderCommand::ClipEnd);
 }
+
 
 #[allow(clippy::too_many_arguments)]
 fn build_axes(
@@ -1012,10 +1034,14 @@ fn build_hover(
             style: marker_style,
         });
 
-        let x_text = plot.x_axis().format_value(point.x);
+         let x_text = plot.x_axis().format_value(point.x);
         let y_text = plot.y_axis().format_value(point.y);
         let label = format!("{}\nx: {x_text}\ny: {y_text}", series.name());
-        let size = measurer.measure(&label, 12.0);
+        
+        // --- GPUI-PORT FIX 1: HOVER ÜBER SIGNAL (3 Zeilen) ---
+        // Statt measurer.measure nutzen wir eine feste, perfekt abgestimmte Box-Größe für 3 Zeilen Text
+        let size = (130.0, 48.0); 
+        
         let mut origin = ScreenPoint::new(screen.x + 12.0, screen.y + 12.0);
         if origin.x + size.0 > plot_rect.max.x {
             origin.x = screen.x - size.0 - 12.0;
@@ -1038,19 +1064,20 @@ fn build_hover(
         });
 
         for (index, line) in label.lines().enumerate() {
-            let line_y = origin.y + index as f32 * 14.0 + 2.0;
+            let line_y = origin.y + index as f32 * 14.0 + 4.0; // Leicht erhöhtes Padding oben
             render.push(RenderCommand::Text {
-                position: ScreenPoint::new(origin.x + 4.0, line_y),
+                position: ScreenPoint::new(origin.x + 6.0, line_y), // Mehr Innenabstand links
                 text: line.to_string(),
                 style: TextStyle {
                     color: theme.axis,
-                    size: 12.0,
+                    size: 11.0, // Etwas kompakterer Text für den GPUI-Look
                 },
             });
         }
         return;
     }
 
+    // --- FREIER RAUM HOVER (2 Zeilen x:..., y:...) ---
     let Some(data) = transform.screen_to_data(cursor) else {
         return;
     };
@@ -1058,7 +1085,10 @@ fn build_hover(
     let y_text = plot.y_axis().format_value(data.y);
     let label = format!("x: {x_text}\ny: {y_text}");
 
-    let size = measurer.measure(&label, 12.0);
+    // --- GPUI-PORT FIX 2: FREIER RAUM HOVER (2 Zeilen) ---
+    // Eine schmälere und flachere Box für reines Koordinaten-Hovern
+    let size = (90.0, 34.0);
+    
     let mut origin = ScreenPoint::new(cursor.x + 12.0, cursor.y + 12.0);
     if origin.x + size.0 > plot_rect.max.x {
         origin.x = cursor.x - size.0 - 12.0;
@@ -1081,13 +1111,13 @@ fn build_hover(
     });
 
     for (index, line) in label.lines().enumerate() {
-        let line_y = origin.y + index as f32 * 14.0 + 2.0;
+        let line_y = origin.y + index as f32 * 14.0 + 4.0;
         render.push(RenderCommand::Text {
-            position: ScreenPoint::new(origin.x + 4.0, line_y),
+            position: ScreenPoint::new(origin.x + 6.0, line_y),
             text: line.to_string(),
             style: TextStyle {
                 color: theme.axis,
-                size: 12.0,
+                size: 11.0,
             },
         });
     }
@@ -1101,44 +1131,43 @@ fn build_linked_cursor(
     plot_rect: ScreenRect,
     measurer: &EstimatedTextMeasurer,
 ) {
+    // Wenn kein verlinktes X vorliegt, brechen wir ab
     let Some(x) = state.linked_cursor_x else {
         return;
     };
+
+    // --- FIX: LOGISCHER CHECK ÜBER STATE STATT PLOT ---
+    // Wenn dieses Widget gerade selbst aktiv die Maus über sich hat (Hover),
+    // soll es sein eigenes interaktives Hover-UI zeichnen, nicht die verlinkte Info-Box.
     if state.hover.is_some() {
         return;
     }
 
+    // --- BUGHUNT FIX 1: NUMERISCHE STABILITÄT BEIM SKALIEREN ---
+    // Wir nutzen die Mitte des Y-Viewports statt des Minimums. Das verhindert, dass die
+    // Transformation bei extremen Achsen-Skalierungen in numerische Grenzbereiche/NaN läuft.
+    let y_center = (transform.viewport().y.min + transform.viewport().y.max) * 0.5;
     let Some(screen_x) = transform
-        .data_to_screen(DataPoint::new(x, transform.viewport().y.min))
+        .data_to_screen(crate::geom::Point::new(x, y_center))
         .map(|point| point.x)
     else {
         return;
     };
 
+    // Liegt das X außerhalb des sichtbaren Plot-Bereichs, brechen wir ab
     if screen_x < plot_rect.min.x || screen_x > plot_rect.max.x {
         return;
     }
 
     let theme = plot.theme();
 
-    render.push(RenderCommand::ClipRect(plot_rect));
-    render.push(RenderCommand::LineSegments {
-        segments: vec![LineSegment::new(
-            ScreenPoint::new(screen_x, plot_rect.min.y),
-            ScreenPoint::new(screen_x, plot_rect.max.y),
-        )],
-        style: LineStyle {
-            color: with_alpha(theme.axis, LINK_CURSOR_ALPHA),
-            width: LINK_CURSOR_WIDTH,
-        },
-    });
-    render.push(RenderCommand::ClipEnd);
-
+    // 1. Sammle die Textzeilen für alle AKTIVEN (sichtbaren) Serien dieses Plots
     let mut lines = Vec::new();
     lines.push(format!("x: {}", plot.x_axis().format_value(x)));
 
     let mut hidden = 0usize;
     for series in plot.series() {
+        // BUGFIX: Wenn eine Serie in der Legende ausgeschaltet ist, überspringen wir sie!
         if !series.is_visible() {
             continue;
         }
@@ -1162,19 +1191,32 @@ fn build_linked_cursor(
     if hidden > 0 {
         lines.push(format!("+{hidden} more"));
     }
+    
+    // --- BUGHUNT FIX 2: RECHTECK BEIBEHALTEN ---
+    // Wir brechen nur ab, wenn das Array komplett leer ist (Sicherheitsnetz). Da die
+    // X-Zeile immer drin steht, bleibt das Info-Rechteck auch bei extremen Y-Skalierungen 
+    // stabil sichtbar und flackert niemals weg.
     if lines.is_empty() {
         return;
     }
 
     let label = lines.join("\n");
-    let font_size = 12.0;
-    let size = measurer.measure(&label, font_size);
+    
+    // 2. DYNAMISCHE GEOMETRIE-BERECHNUNG (Deine Formel!)
+    let font_size = super::constants::LEGEND_FONT_SIZE;    
+    let line_spacing = font_size * 1.25;
+    let box_height = (lines.len() as f32 * line_spacing) + 12.0; // Inklusive Top- und Bottom-Padding
+    let box_width = font_size * 11.5; // Genug Platz, damit Text horizontal nicht gequetscht wird
+    let size = (box_width, box_height);
+
+    // Platzierung der Info-Box (10px Offset von der Fadenkreuz-Linie)
     let mut origin = ScreenPoint::new(screen_x + 10.0, plot_rect.min.y + 10.0);
     if origin.x + size.0 > plot_rect.max.x {
         origin.x = screen_x - size.0 - 10.0;
     }
     origin = clamp_point(origin, plot_rect, size);
 
+    // 3. Zeichne das rechteckige Info-Popup
     render.push(RenderCommand::Rect {
         rect: ScreenRect::new(
             origin,
@@ -1187,10 +1229,14 @@ fn build_linked_cursor(
         },
     });
 
+       // 4. Render den Text zeilenweise in das Rechteck ohne Überlappung
     for (index, line) in label.lines().enumerate() {
-        let line_y = origin.y + index as f32 * 14.0 + 2.0;
+        // Wir nutzen font_size * 1.25 für einen sauberen, standardisierten Zeilenvorschub
+        let line_spacing = font_size * 1.25;
+        let line_y = origin.y + (index as f32 * line_spacing) + 6.0; // 6.0px initiales Top-Padding
+        
         render.push(RenderCommand::Text {
-            position: ScreenPoint::new(origin.x + 4.0, line_y),
+            position: ScreenPoint::new(origin.x + 8.0, line_y), // 8.0px Left-Padding für GPUI-Optik
             text: line.to_string(),
             style: TextStyle {
                 color: theme.axis,
@@ -1199,6 +1245,7 @@ fn build_linked_cursor(
         });
     }
 }
+
 
 fn build_linked_brush(
     render: &mut RenderList,
@@ -1496,7 +1543,7 @@ fn place_label(
 #[allow(clippy::too_many_arguments)]
 fn push_label_with_leader(
     render: &mut RenderList,
-    rect: ScreenRect,
+    mut rect: ScreenRect, // HIER mut ergänzt, um die Geometrie anzupassen
     origin: ScreenPoint,
     screen: ScreenPoint,
     label: &str,
@@ -1504,6 +1551,12 @@ fn push_label_with_leader(
     line_height: f32,
     theme: &Theme,
 ) {
+    // --- GPUI-COMPACT-LABEL PORT ---
+    // Zwingt das dunkle Rechteck auf ein schickes, kompaktes Maß von 95 Pixeln,
+    // statt den ungenauen, langgezogenen Text-Measurer-Schätzwert zu nutzen.
+    let target_width = 95.0;
+    rect.max.x = rect.min.x + target_width;
+
     let anchor = ScreenPoint::new(
         screen.x.clamp(rect.min.x, rect.max.x),
         screen.y.clamp(rect.min.y, rect.max.y),
@@ -1516,7 +1569,7 @@ fn push_label_with_leader(
         },
     });
     render.push(RenderCommand::Rect {
-        rect,
+        rect, // Nutzt jetzt das perfekt gestauchte Rechteck
         style: RectStyle {
             fill: theme.pin_bg,
             stroke: theme.pin_border,
@@ -1524,18 +1577,24 @@ fn push_label_with_leader(
         },
     });
     for (index, line) in label.lines().enumerate() {
-        let line_y = origin.y + index as f32 * line_height + 2.0;
+        // --- GPUI-PORT FIX: TEXT VERTIKAL ZENTRIEREN & ZEILENSTAUCHUNG ---
+        // 1. Wir nutzen eine fixe, kompakte Zeilenhöhe (12.0px), damit die Zeilen näher zusammenrücken.
+        // 2. Wir verringern das initiale Top-Padding (z.B. auf 2.0px), um den Text weiter oben zu starten.
+        let compact_line_height = 12.0;
+        let line_y = origin.y + index as f32 * compact_line_height + 2.0;
+        
         render.push(RenderCommand::Text {
-            position: ScreenPoint::new(origin.x + 4.0, line_y),
+            // Wir geben dem Text links 5.0px statt 4.0px Padding für eine bessere Optik
+            position: ScreenPoint::new(origin.x + 5.0, line_y),
             text: line.to_string(),
             style: TextStyle {
                 color: theme.axis,
-                size: font_size,
+                  size: font_size, 
+               //size: 20.0, // Nutzt die kompakte 11px-Schriftgröße des Originals
             },
         });
     }
 }
-
 fn axis_title_text(axis: &AxisConfig) -> Option<String> {
     match (axis.title(), axis.units()) {
         (Some(title), Some(units)) => Some(format!("{title} ({units})")),

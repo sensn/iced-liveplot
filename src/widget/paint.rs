@@ -137,9 +137,13 @@ fn paint_text(frame: &mut canvas::Frame, position: &ScreenPoint, text: &str, sty
         position: to_point(*position),
         color: style.color,
         size: iced::Pixels(style.size),
+        // HIER ERGÄNZEN: Begrenzt die Box horizontal auf z.B. 90 oder 100 Pixel,
+        // wodurch der Text sauber in ein kompaktes Rechteck umbricht.
+        max_width: 100.0, 
         ..Default::default()
     });
 }
+
 
 fn to_point(p: ScreenPoint) -> Point {
     Point::new(p.x, p.y)
