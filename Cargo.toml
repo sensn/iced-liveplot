@@ -1,0 +1,17 @@
+[package]
+name = "iced-liveplot"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Live plotting library for iced (ported from gpui-liveplot)"
+
+[dependencies]
+iced = { path = "../iced", features = ["canvas", "tokio" ,"advanced"] }
+
+[[bin]]
+name = "basic"
+path = "src/bin/basic.rs"
+
+#[[bin]]
+#name = "advanced"
+#path = "src/bin/advanced.rs"
