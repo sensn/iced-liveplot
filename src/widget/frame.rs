@@ -1136,16 +1136,15 @@ fn build_linked_cursor(
         return;
     };
 
-    // --- FIX: LOGISCHER CHECK ÜBER STATE STATT PLOT ---
+    // --- COUPLING-BUGFIX: STATISCHE WECHSEL-ERKENNUNG ÜBER STATE ---
     // Wenn dieses Widget gerade selbst aktiv die Maus über sich hat (Hover),
-    // soll es sein eigenes interaktives Hover-UI zeichnen, nicht die verlinkte Info-Box.
+    // zeichnet es sein eigenes primäres interaktives Hover-UI.
+    // Das passive Partner-Widget hat state.hover = None und überspringt die Sperre!
     if state.hover.is_some() {
         return;
     }
 
-    // --- BUGHUNT FIX 1: NUMERISCHE STABILITÄT BEIM SKALIEREN ---
-    // Wir nutzen die Mitte des Y-Viewports statt des Minimums. Das verhindert, dass die
-    // Transformation bei extremen Achsen-Skalierungen in numerische Grenzbereiche/NaN läuft.
+    // Numerisch stabile Transformation über die Mitte der Y-Achse
     let y_center = (transform.viewport().y.min + transform.viewport().y.max) * 0.5;
     let Some(screen_x) = transform
         .data_to_screen(crate::geom::Point::new(x, y_center))
@@ -1154,6 +1153,7 @@ fn build_linked_cursor(
         return;
     };
 
+
     // Liegt das X außerhalb des sichtbaren Plot-Bereichs, brechen wir ab
     if screen_x < plot_rect.min.x || screen_x > plot_rect.max.x {
         return;
@@ -1161,13 +1161,27 @@ fn build_linked_cursor(
 
     let theme = plot.theme();
 
+    // --- GPUI-BUGFIX 2: VERTIKALE FADENKREUZ-LINIE WIEDER EINFÜGEN ---
+    // Dieser Block fehlte in der Iced-Portierung! Zeichnet die vertikale Synchron-Linie.
+    render.push(RenderCommand::ClipRect(plot_rect));
+    render.push(RenderCommand::LineSegments {
+        segments: vec![LineSegment::new(
+            ScreenPoint::new(screen_x, plot_rect.min.y),
+            ScreenPoint::new(screen_x, plot_rect.max.y),
+        )],
+        style: LineStyle {
+            color: with_alpha(theme.axis, super::constants::LINK_CURSOR_ALPHA),
+            width: super::constants::LINK_CURSOR_WIDTH,
+        },
+    });
+    render.push(RenderCommand::ClipEnd);
+
     // 1. Sammle die Textzeilen für alle AKTIVEN (sichtbaren) Serien dieses Plots
     let mut lines = Vec::new();
     lines.push(format!("x: {}", plot.x_axis().format_value(x)));
 
     let mut hidden = 0usize;
     for series in plot.series() {
-        // BUGFIX: Wenn eine Serie in der Legende ausgeschaltet ist, überspringen wir sie!
         if !series.is_visible() {
             continue;
         }
@@ -1192,10 +1206,6 @@ fn build_linked_cursor(
         lines.push(format!("+{hidden} more"));
     }
     
-    // --- BUGHUNT FIX 2: RECHTECK BEIBEHALTEN ---
-    // Wir brechen nur ab, wenn das Array komplett leer ist (Sicherheitsnetz). Da die
-    // X-Zeile immer drin steht, bleibt das Info-Rechteck auch bei extremen Y-Skalierungen 
-    // stabil sichtbar und flackert niemals weg.
     if lines.is_empty() {
         return;
     }
@@ -1205,8 +1215,8 @@ fn build_linked_cursor(
     // 2. DYNAMISCHE GEOMETRIE-BERECHNUNG (Deine Formel!)
     let font_size = super::constants::LEGEND_FONT_SIZE;    
     let line_spacing = font_size * 1.25;
-    let box_height = (lines.len() as f32 * line_spacing) + 12.0; // Inklusive Top- und Bottom-Padding
-    let box_width = font_size * 11.5; // Genug Platz, damit Text horizontal nicht gequetscht wird
+    let box_height = (lines.len() as f32 * line_spacing) + 12.0;
+    let box_width = font_size * 11.5;
     let size = (box_width, box_height);
 
     // Platzierung der Info-Box (10px Offset von der Fadenkreuz-Linie)
@@ -1229,14 +1239,11 @@ fn build_linked_cursor(
         },
     });
 
-       // 4. Render den Text zeilenweise in das Rechteck ohne Überlappung
+    // 4. Render den Text zeilenweise in das Rechteck ohne Überlappung
     for (index, line) in label.lines().enumerate() {
-        // Wir nutzen font_size * 1.25 für einen sauberen, standardisierten Zeilenvorschub
-        let line_spacing = font_size * 1.25;
-        let line_y = origin.y + (index as f32 * line_spacing) + 6.0; // 6.0px initiales Top-Padding
-        
+        let line_y = origin.y + (index as f32 * line_spacing) + 6.0;
         render.push(RenderCommand::Text {
-            position: ScreenPoint::new(origin.x + 8.0, line_y), // 8.0px Left-Padding für GPUI-Optik
+            position: ScreenPoint::new(origin.x + 8.0, line_y),
             text: line.to_string(),
             style: TextStyle {
                 color: theme.axis,
@@ -1245,7 +1252,6 @@ fn build_linked_cursor(
         });
     }
 }
-
 
 fn build_linked_brush(
     render: &mut RenderList,
@@ -1261,14 +1267,18 @@ fn build_linked_brush(
         return;
     }
 
+    // --- GPUI-BUGFIX 3: NUMERISCH STABILES BRUSH-TRANSFORM ---
+    // Genau wie beim Cursor nutzen wir hier die Mitte des Y-Viewports, damit die X-Pixel-Berechnung
+    // des Pinsels beim Skalieren der Y-Achse nicht in ungültige Grenzbereiche gerät.
+    let y_center = (transform.viewport().y.min + transform.viewport().y.max) * 0.5;
     let Some(start_x) = transform
-        .data_to_screen(DataPoint::new(range.min, transform.viewport().y.min))
+        .data_to_screen(crate::geom::Point::new(range.min, y_center))
         .map(|point| point.x)
     else {
         return;
     };
     let Some(end_x) = transform
-        .data_to_screen(DataPoint::new(range.max, transform.viewport().y.min))
+        .data_to_screen(crate::geom::Point::new(range.max, y_center))
         .map(|point| point.x)
     else {
         return;
@@ -1288,8 +1298,8 @@ fn build_linked_brush(
             ScreenPoint::new(max_x, plot_rect.max.y),
         ),
         style: RectStyle {
-            fill: with_alpha(theme.selection_fill, LINK_BRUSH_FILL_ALPHA),
-            stroke: with_alpha(theme.selection_border, LINK_BRUSH_BORDER_ALPHA),
+            fill: with_alpha(theme.selection_fill, super::constants::LINK_BRUSH_FILL_ALPHA),
+            stroke: with_alpha(theme.selection_border, super::constants::LINK_BRUSH_BORDER_ALPHA),
             stroke_width: 1.0,
         },
     });
