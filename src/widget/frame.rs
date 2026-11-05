@@ -1125,8 +1125,9 @@ fn build_linked_cursor(
         return;
     };
 
-    // --- COUPLING-BUGFIX: STATISCHE WECHSEL-ERKENNUNG ÜBER STATE ---
+    // --- DEBUG 1: PRÜFEN OB DER FRÜHE ABBRUCH TRAGIERT ---
     if state.hover.is_some() {
+        println!("[DEBUG] linked_cursor abgebrochen, weil state.hover aktiv ist! plot_rect: {:?}", plot_rect);
         return;
     }
 
@@ -1136,11 +1137,16 @@ fn build_linked_cursor(
         .data_to_screen(crate::geom::Point::new(x, y_center))
         .map(|point| point.x)
     else {
+        println!("[DEBUG] Transformation fehlgeschlagen für x={} bei rect: {:?}", x, plot_rect);
         return;
     };
 
     // Liegt das X außerhalb des sichtbaren Plot-Bereichs, brechen wir ab
     if screen_x < plot_rect.min.x || screen_x > plot_rect.max.x {
+        println!(
+            "[DEBUG] screen_x ({:.2}) außerhalb plot_rect ({:.2} - {:.2})", 
+            screen_x, plot_rect.min.x, plot_rect.max.x
+        );
         return;
     }
 
@@ -1162,7 +1168,7 @@ fn build_linked_cursor(
 
     // 1. Sammle die Textzeilen für alle AKTIVEN (sichtbaren) Serien dieses Plots
     let mut lines = Vec::new();
-    lines.push(format!("x:{}", plot.x_axis().format_value(x))); // Leerzeichen entfernt
+    lines.push(format!("x:{}", plot.x_axis().format_value(x)));
 
     let mut hidden = 0usize;
     for series in plot.series() {
@@ -1176,9 +1182,6 @@ fn build_linked_cursor(
         });
         if let Some(point) = point {
             if lines.len() <= 6 {
-                // --- FIX 1: LEERZEICHEN NACH DOPPELPUNKT ENTFERNEN ---
-                // Ohne Leerzeichen sieht Iced die Zeile als zusammenhängenden Block 
-                // und bricht den Wert niemals mitten im Text um!
                 lines.push(format!(
                     "{}:{}",
                     series.name(),
@@ -1194,6 +1197,7 @@ fn build_linked_cursor(
     }
     
     if lines.is_empty() {
+        println!("[DEBUG] Keine Linien/Serien-Daten zum Anzeigen gefunden für rect: {:?}", plot_rect);
         return;
     }
 
@@ -1204,9 +1208,6 @@ fn build_linked_cursor(
     let line_height = 14.0;
     
     let box_height = (lines.len() as f32 * line_height) + 8.0; 
-    
-    // --- FIX 2: RECHTECK HORIZONTAL GROSSZÜGIG WEITEN ---
-    // 165.0 Pixel bieten genug Puffer für lange Namen ("events(scatter)") inkl. Vorzeichen
     let box_width = 165.0; 
     let size = (box_width, box_height);
 
@@ -1215,7 +1216,16 @@ fn build_linked_cursor(
     if origin.x + size.0 > plot_rect.max.x {
         origin.x = screen_x - size.0 - 10.0;
     }
-    origin = clamp_point(origin, plot_rect, size);
+    
+    let clamped_origin = clamp_point(origin, plot_rect, size);
+
+    // --- DEBUG 2: EXAKTE KOORDINATEN DER INFOBOX IM PLOT ---
+    println!(
+        "[DEBUG] INFOBOX BERECHNET -> screen_x: {:.1}, plot_rect: (min_y: {:.1}, max_y: {:.1}), Ursprung vor Clamp: ({:.1}, {:.1}), nach Clamp: ({:.1}, {:.1})",
+        screen_x, plot_rect.min.y, plot_rect.max.y, origin.x, origin.y, clamped_origin.x, clamped_origin.y
+    );
+
+    origin = clamped_origin;
 
     // 3. Zeichne das rechteckige Info-Popup
     render.push(RenderCommand::Rect {

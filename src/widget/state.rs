@@ -103,6 +103,8 @@ pub struct PlotUiState {
     pub(crate) decimation_scratch: DecimationScratch,
     pub(crate) series_cache: HashMap<SeriesId, SeriesCache>,
     pub(crate) legend_layout: Option<LegendLayout>,
+   
+
 }
 
 impl Default for PlotUiState {
