@@ -1126,6 +1126,7 @@ fn build_linked_cursor(
     };
  // --- COUPLING-FIX ÜBER EINDEUTIGE PLOT-ID ---
              // --- NEUER FIX ÜBER LOKALES HOVER-TARGET ---
+             /*
  // --- NEUER ANTEIL: ACHSEN-BEREICH DEBUG ---
     println!(
         "[DEBUG: {}] Empfangenes verlinktes X: {:.2} | Lokaler X-Viewport des Plots: {:.2} bis {:.2}",
@@ -1134,7 +1135,7 @@ fn build_linked_cursor(
         transform.viewport().x.min, 
         transform.viewport().x.max
     );             
-    
+  */  
                 // --- DER ENTKOPPELTE LOCAL-PLOT FIX ---
     if plot.is_mouse_actively_inside {
         return;
@@ -1264,13 +1265,13 @@ fn build_linked_cursor(
     }
     
     let clamped_origin = clamp_point(origin, plot_rect, size);
-
+/*
     // --- DEBUG 2: EXAKTE KOORDINATEN DER INFOBOX IM PLOT ---
     println!(
         "[DEBUG] INFOBOX BERECHNET -> screen_x: {:.1}, plot_rect: (min_y: {:.1}, max_y: {:.1}), Ursprung vor Clamp: ({:.1}, {:.1}), nach Clamp: ({:.1}, {:.1})",
         screen_x, plot_rect.min.y, plot_rect.max.y, origin.x, origin.y, clamped_origin.x, clamped_origin.y
     );
-
+*/
     origin = clamped_origin;
 
     // 3. Zeichne das rechteckige Info-Popup

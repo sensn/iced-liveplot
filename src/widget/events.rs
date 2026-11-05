@@ -212,82 +212,92 @@ fn handle_mouse_move(
         }
         //  state.hovered_plot_id = None; // <-- Neu: ID zurücksetzen
         if state.hover.take().is_some() || state.hover_target.take().is_some() {
-
             program.request_redraw();
         }
         return;
     };
 
-    // --- GPUI-LINK FIX: LOKALER HOVER VS. GLOBALES SYNC ---
+    // Bestimme exakt, in welchem Bereich des Widgets sich die Maus befindet
     let hit_region = state.regions.hit_test(pos);
 
-    if hit_region == HitRegion::Outside {
-           // state.is_mouse_inside = false; // <-- Hier deaktivieren!
+    // --- PRÄZISE HITREGION-WEICHE MIT INTEGRATION DES UNGETEILTEN PLOT-FLAGS ---
+    match hit_region {
+        HitRegion::Plot => {
+            // --- DEBUG-PRINT: AUSLESEN DER AKTUELLEN PLOT ID ---
+            println!("[DEBUG: MOUSE_MOVE] Maus ist AKTIV über der Signalfläche von: {}", program.plot().id);
+
+            //  state.is_mouse_inside = true; // <-- HIER AKTIVIEREN!
+            state.hover = Some(pos);
             
-            // --- TEST-ERWEITERUNG: LOKALES FLUSH BEI OUTSIDE ---
+            // Lokalen, ungeteilten Plot-Zustand exklusiv für das Signal-Rechteck aktivieren
+            program.with_plot_mut(|plot| {
+                plot.is_mouse_actively_inside = true;
+            });
+
+            // Track the hover target (pin removal needs the `is_pinned` threshold).
+            if let Some(transform) = state.transform.clone() {
+                if let Some(plot_rect) = state.plot_rect {
+                    let (pin_threshold, unpin_threshold) = {
+                        let config = program.config();
+                        (config.pin_threshold_px, config.unpin_threshold_px)
+                    };
+                    update_hover_target(
+                        &program.plot(),
+                        state,
+                        &transform,
+                        plot_rect,
+                        pin_threshold,
+                        unpin_threshold,
+                    );
+                }
+            }
+        }
+        HitRegion::XAxis | HitRegion::YAxis => {
+            // Maus ist auf den Achsen: Ausblenden des Kurvenhovers,
+            // aber das Flag wird auf false gesetzt, da wir uns außerhalb der Signalfläche befinden!
             program.with_plot_mut(|plot| {
                 plot.is_mouse_actively_inside = false;
             });
 
-       //  state.hovered_plot_id = None; // <-- Neu: ID zurücksetzen
-        // Maus ist im Randbereich: Lokales Hover-Tooltip ausblenden...
-        if state.hover.take().is_some() || state.hover_target.take().is_some() {
-
-            program.request_redraw();
+            if state.hover_target.take().is_some() {
+                program.request_redraw();
+            }
+            state.hover = Some(pos);
         }
-        
-        // ...ABER wir senden trotzdem die X-Koordinate an den verlinkten Plot, 
-        // damit die Infobox beim senkrechten Wechsel nicht einfriert!
-        if let (Some(link), Some(transform)) = (program.link_binding(), state.transform.clone()) {
-            if link.options.link_cursor {
-                if let Some(data_point) = transform.screen_to_data(pos) {
-                    link.group.publish_cursor_x(link.member_id, Some(data_point.x));
+        HitRegion::Outside => {
+            // Maus ist komplett im ungenutzten Außenbereich/Rand
+            // state.is_mouse_inside = false; // <-- Hier deaktivieren!
+            
+            program.with_plot_mut(|plot| {
+                plot.is_mouse_actively_inside = false;
+            });
+
+            //  state.hovered_plot_id = None; // <-- Neu: ID zurücksetzen
+            if state.hover.take().is_some() || state.hover_target.take().is_some() {
+                program.request_redraw();
+            }
+            
+            // ...ABER wir senden trotzdem die X-Koordinate an den verlinkten Plot, 
+            // damit die Infobox beim senkrechten Wechsel nicht einfriert!
+            if let (Some(link), Some(transform)) = (program.link_binding(), state.transform.clone()) {
+                if link.options.link_cursor {
+                    if let Some(data_point) = transform.screen_to_data(pos) {
+                        link.group.publish_cursor_x(link.member_id, Some(data_point.x));
+                    }
                 }
             }
+            return; // Randbereich-Verarbeitung beenden
         }
-        return; // Randbereich-Verarbeitung beenden
     }
 
-    // Wenn wir hier sind, ist die Maus über einer echten aktiven Region (Plot, XAxis, YAxis)
-    
-       // Wenn wir hier sind, ist die Maus über einer echten aktiven Region
-         //  state.is_mouse_inside = true; // <-- HIER AKTIVIEREN!
-           
-    // --- TEST-ERWEITERUNG: LOKALEN AKTIVEN PLOT-ZUSTAND IM WIDGET SPEICHERN ---
-    program.with_plot_mut(|plot| {
-        plot.is_mouse_actively_inside = true;
-    });
-
-    state.hover = Some(pos);
-       // state.hovered_plot_id = Some(program.plot().id.clone()); // <-- Aktiv setzen!
     // --- GPUI-LINK FIX: NUR WENN DIE MAUS TATSÄCHLICH INTERAGIERT ---
-    // Wir setzen die hovered_plot_id nur, wenn wir uns in einer echten Hit-Region befinden,
-    // die nicht Outside ist (das haben wir oben abgefangen).
     if hit_region != HitRegion::Outside {
         state.hovered_plot_id = Some(program.plot().id.clone());
     }
-    //state.hovered_plot_id = Some(plot.id.clone()); // <-- Neu: Die ID des aktiven Plots mitspeichern!
-    // Track the hover target (pin removal needs the `is_pinned` threshold).
-    if let Some(transform) = state.transform.clone() {
-        let Some(plot_rect) = state.plot_rect else {
-            return;
-        };
-        let (pin_threshold, unpin_threshold) = {
-            let config = program.config();
-            (config.pin_threshold_px, config.unpin_threshold_px)
-        };
-        update_hover_target(
-            &program.plot(),
-            state,
-            &transform,
-            plot_rect,
-            pin_threshold,
-            unpin_threshold,
-        );
-    }
 
+    // --- DRAG & VIEWPORT-MANIPULATION ---
     let Some(drag) = state.drag.clone() else {
-        // Sende X-Koordinate bei normaler Mausbewegung (Hover ohne Drag)
+        // Kein aktiver Drag: Sende Standard-Hover-Koordinaten an die verlinkte Gruppe
         if let (Some(link), Some(transform)) = (program.link_binding(), state.transform.clone()) {
             if link.options.link_cursor {
                 if let Some(data_point) = transform.screen_to_data(pos) {
@@ -303,7 +313,7 @@ fn handle_mouse_move(
         return;
     }
 
-      let delta = ScreenPoint::new(pos.x - drag.last.x, pos.y - drag.last.y);
+    let delta = ScreenPoint::new(pos.x - drag.last.x, pos.y - drag.last.y);
 
     if drag.mode == DragMode::ZoomRect {
         state.selection_rect = Some(ScreenRect::new(drag.last, pos));
@@ -317,58 +327,28 @@ fn handle_mouse_move(
                 return;
             };
 
-            // --- GPUI HIGH-DPI TRACKING PORT ---
-            // GPUI operiert nativ auf physikalischen Pixeln. Um denselben tiefen Zoom-Effekt 
-            // in Iced zu erzielen, kompensieren wir den logischen Pixel-Verlust, indem wir 
-            // das Delta mit dem Skalierungsfaktor des Displays multiplizieren (z.B. Faktor 1.5 oder 2.0).
-            // Falls das Widget kein dynamisches Scale-Feld exportiert, ist ein Boost-Faktor von 2.0 
-            // der mathematische Standard für moderne High-DPI Desktops.
             let dpi_scale = 2.0; 
-            let adjusted_delta_x = delta.x * dpi_scale;
-            let adjusted_delta_y = delta.y * dpi_scale;
+            let _adjusted_delta_x = delta.x * dpi_scale;
+            let _adjusted_delta_y = delta.y * dpi_scale;
 
-                               let next = match drag.mode {
+            let next = match drag.mode {
                 DragMode::Pan => pan_viewport(viewport, delta, &transform),
                 DragMode::ZoomX => {
                     let axis_pixels = rect.max.x - rect.min.x;
                     let raw_factor = zoom_factor_from_drag(delta.x, axis_pixels);
-                    
-                    // --- THE DEEP ZOOM FIX: SENSITIVITY EQUALIZER ---
-                    // Da Iced das Delta in logischen Pixeln liefert, die Achsenlänge aber 
-                    // in physikalischen Einheiten steht, halbieren wir die Zoom-Wirkung.
-                    // Wir quadrieren den Faktor (oder wenden die Zweierpotenz an), um den 
-                    // linearen Verlust perfekt auszugleichen, ohne das Koordinatensystem zu brechen.
-                    let factor = if raw_factor < 1.0 {
-                        raw_factor.powi(2) // Zoom In wird deutlich verstärkt und tiefer
-                    } else {
-                        raw_factor // Zoom Out bleibt stabil
-                    };
-
-                    let center = transform
-                        .screen_to_data(pos)
-                        .unwrap_or_else(|| viewport_center(&viewport));
+                    let factor = if raw_factor < 1.0 { raw_factor.powi(2) } else { raw_factor };
+                    let center = transform.screen_to_data(pos).unwrap_or_else(|| viewport_center(&viewport));
                     Some(zoom_viewport(viewport, center, factor, 1.0))
                 }
                 DragMode::ZoomY => {
                     let axis_pixels = rect.max.y - rect.min.y;
                     let raw_factor = zoom_factor_from_drag(-delta.y, axis_pixels);
-                    
-                    // --- THE DEEP ZOOM FIX: SENSITIVITY EQUALIZER ---
-                    let factor = if raw_factor < 1.0 {
-                        raw_factor.powi(2)
-                    } else {
-                        raw_factor
-                    };
-
-                    let center = transform
-                        .screen_to_data(pos)
-                        .unwrap_or_else(|| viewport_center(&viewport));
+                    let factor = if raw_factor < 1.0 { raw_factor.powi(2) } else { raw_factor };
+                    let center = transform.screen_to_data(pos).unwrap_or_else(|| viewport_center(&viewport));
                     Some(zoom_viewport(viewport, center, 1.0, factor))
                 }
                 DragMode::ZoomRect => unreachable!("handled above"),
             };
-
-
 
             if let Some(next) = next {
                 apply_manual_view(program, plot, state, rect, next);
@@ -376,11 +356,10 @@ fn handle_mouse_move(
         });
     }
 
-
     state.drag.as_mut().expect("checked above").last = pos;
     state.pending_click = None;
 
-    // Sende X-Koordinate nach einem Zoom oder Pan-Drag
+    // Synchronisiere X-Achse nach Pan/Zoom im verlinkten Verbund
     if let (Some(link), Some(transform)) = (program.link_binding(), state.transform.clone()) {
         if link.options.link_cursor {
             if let Some(data_point) = transform.screen_to_data(pos) {
@@ -389,7 +368,6 @@ fn handle_mouse_move(
         }
     }
 }
-
 
 fn handle_mouse_up(
     program: &Program,
