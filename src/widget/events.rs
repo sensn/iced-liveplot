@@ -4,7 +4,7 @@
 //! `on_mouse_move`, `on_mouse_up`, `on_scroll`, `on_hover_state_change`) on
 //! top of the shared interaction helpers (`pan_viewport`, `zoom_viewport`,
 //! `zoom_to_rect`, `toggle_pin`, `zoom_factor_from_drag`).
-
+// use crate::widget::plot;
 use iced::mouse;
 use iced::widget::canvas::{self, Action, Event};
 use iced::Rectangle;
@@ -187,6 +187,13 @@ fn handle_mouse_move(
     position: Option<ScreenPoint>,
 ) {
     let Some(pos) = position else {
+         //   state.is_mouse_inside = false; // <-- Hier deaktivieren!
+            
+            // --- TEST-ERWEITERUNG: LOKALES FLUSH BEI CURSOR LEFT ---
+            program.with_plot_mut(|plot| {
+                plot.is_mouse_actively_inside = false;
+            });
+
         // Cursor left the canvas: clear hover (GPUI `on_hover_state_change`).
         let still_inside = state
             .hover
@@ -203,8 +210,9 @@ fn handle_mouse_move(
                 link.group.publish_cursor_x(link.member_id, None);
             }
         }
-
+        //  state.hovered_plot_id = None; // <-- Neu: ID zurücksetzen
         if state.hover.take().is_some() || state.hover_target.take().is_some() {
+
             program.request_redraw();
         }
         return;
@@ -214,8 +222,17 @@ fn handle_mouse_move(
     let hit_region = state.regions.hit_test(pos);
 
     if hit_region == HitRegion::Outside {
+           // state.is_mouse_inside = false; // <-- Hier deaktivieren!
+            
+            // --- TEST-ERWEITERUNG: LOKALES FLUSH BEI OUTSIDE ---
+            program.with_plot_mut(|plot| {
+                plot.is_mouse_actively_inside = false;
+            });
+
+       //  state.hovered_plot_id = None; // <-- Neu: ID zurücksetzen
         // Maus ist im Randbereich: Lokales Hover-Tooltip ausblenden...
         if state.hover.take().is_some() || state.hover_target.take().is_some() {
+
             program.request_redraw();
         }
         
@@ -232,8 +249,24 @@ fn handle_mouse_move(
     }
 
     // Wenn wir hier sind, ist die Maus über einer echten aktiven Region (Plot, XAxis, YAxis)
-    state.hover = Some(pos);
+    
+       // Wenn wir hier sind, ist die Maus über einer echten aktiven Region
+         //  state.is_mouse_inside = true; // <-- HIER AKTIVIEREN!
+           
+    // --- TEST-ERWEITERUNG: LOKALEN AKTIVEN PLOT-ZUSTAND IM WIDGET SPEICHERN ---
+    program.with_plot_mut(|plot| {
+        plot.is_mouse_actively_inside = true;
+    });
 
+    state.hover = Some(pos);
+       // state.hovered_plot_id = Some(program.plot().id.clone()); // <-- Aktiv setzen!
+    // --- GPUI-LINK FIX: NUR WENN DIE MAUS TATSÄCHLICH INTERAGIERT ---
+    // Wir setzen die hovered_plot_id nur, wenn wir uns in einer echten Hit-Region befinden,
+    // die nicht Outside ist (das haben wir oben abgefangen).
+    if hit_region != HitRegion::Outside {
+        state.hovered_plot_id = Some(program.plot().id.clone());
+    }
+    //state.hovered_plot_id = Some(plot.id.clone()); // <-- Neu: Die ID des aktiven Plots mitspeichern!
     // Track the hover target (pin removal needs the `is_pinned` threshold).
     if let Some(transform) = state.transform.clone() {
         let Some(plot_rect) = state.plot_rect else {

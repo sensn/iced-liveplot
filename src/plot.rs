@@ -23,6 +23,8 @@ pub struct Plot {
     viewport: Option<Viewport>,
     series: Vec<Series>,
     pins: Vec<Pin>,
+    pub(crate) id: String, // <- Neu hinzufügen
+    pub(crate) is_mouse_actively_inside: bool, // <-- HIER ERGÄNZEN!
 }
 
 impl Plot {
@@ -38,12 +40,19 @@ impl Plot {
             viewport: None,
             series: Vec::new(),
             pins: Vec::new(),
+            id: String::new(), // <- Hier initialisieren
+            is_mouse_actively_inside: false,
+       
         }
     }
-
+     // Falls du eine Getter-Methode brauch hergeben willst:
+  
     /// Start building a plot with custom configuration.
     pub fn builder() -> PlotBuilder {
         PlotBuilder::default()
+    }
+      pub fn id(&self) -> &str {
+        &self.id
     }
 
     /// Access the current theme.
@@ -259,9 +268,15 @@ pub struct PlotBuilder {
     y_axis: AxisConfig,
     view: View,
     series: Vec<Series>,
+    id: String, // <- Neu
 }
 
 impl PlotBuilder {
+     /// Set a unique ID for the plot to distinguish linked instances.
+    pub fn id(mut self, id: impl Into<String>) -> Self {
+        self.id = id.into();
+        self
+    }
     /// Set the theme used by the plot.
     pub fn theme(mut self, theme: Theme) -> Self {
         self.theme = theme;
@@ -304,6 +319,9 @@ impl PlotBuilder {
             viewport: None,
             series: self.series,
             pins: Vec::new(),
+            id: self.id, // <- Neu weiterreichen
+            is_mouse_actively_inside: false,
+
         }
     }
 }

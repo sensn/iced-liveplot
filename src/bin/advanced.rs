@@ -122,6 +122,7 @@ impl App {
         );
 
         let mut top_plot = Plot::builder()
+            .id("top_plot") // <- Eindeutige ID
             .theme(Theme::dark())
             .x_axis(AxisConfig::builder().title("Sample").build())
             .y_axis(AxisConfig::builder().title("Top: stream + events").build())
@@ -131,6 +132,7 @@ impl App {
         top_plot.add_series(&events);
 
         let mut bottom_plot = Plot::builder()
+            .id("bottom_plot") // <- Eindeutige ID
             .theme(Theme::dark())
             .x_axis(AxisConfig::builder().title("Sample").build())
             .y_axis(

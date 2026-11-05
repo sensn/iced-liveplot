@@ -103,7 +103,9 @@ pub struct PlotUiState {
     pub(crate) decimation_scratch: DecimationScratch,
     pub(crate) series_cache: HashMap<SeriesId, SeriesCache>,
     pub(crate) legend_layout: Option<LegendLayout>,
-   
+    pub hovered_plot_id: Option<String>, // <- Neu: Wer hält das Hover-Event?
+   // pub is_mouse_inside: bool,
+
 
 }
 
@@ -135,6 +137,9 @@ impl Default for PlotUiState {
             decimation_scratch: DecimationScratch::new(),
             series_cache: HashMap::new(),
             legend_layout: None,
+            hovered_plot_id: None,
+            //is_mouse_inside: false,
+
         }
     }
 }

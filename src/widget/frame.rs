@@ -1124,13 +1124,59 @@ fn build_linked_cursor(
     let Some(x) = state.linked_cursor_x else {
         return;
     };
-
-    // --- DEBUG 1: PRÜFEN OB DER FRÜHE ABBRUCH TRAGIERT ---
-    if state.hover.is_some() {
-        println!("[DEBUG] linked_cursor abgebrochen, weil state.hover aktiv ist! plot_rect: {:?}", plot_rect);
+ // --- COUPLING-FIX ÜBER EINDEUTIGE PLOT-ID ---
+             // --- NEUER FIX ÜBER LOKALES HOVER-TARGET ---
+ // --- NEUER ANTEIL: ACHSEN-BEREICH DEBUG ---
+    println!(
+        "[DEBUG: {}] Empfangenes verlinktes X: {:.2} | Lokaler X-Viewport des Plots: {:.2} bis {:.2}",
+        plot.id, 
+        x, 
+        transform.viewport().x.min, 
+        transform.viewport().x.max
+    );             
+    
+                // --- DER ENTKOPPELTE LOCAL-PLOT FIX ---
+    if plot.is_mouse_actively_inside {
         return;
     }
 
+                        // --- AUSFALLSICHERER LOCAL-POINTER FIX ---
+  //  if state.is_mouse_inside {
+        // Die Maus ist physisch in diesem Plot aktiv.
+        // Das lokale Standard-Hover zieht, verlinkter Cursor bricht ab.
+       // return;
+  //  }
+/*        
+    // --- FINALER ID-FIX: PRÜFEN OB DIESER PLOT DIE MAUS HÄLT ---
+    if let Some(ref hovered_id) = state.hovered_plot_id {
+        if hovered_id == &plot.id {
+            // Die Maus ist physisch in diesem Plot. 
+            // Das lokale Hover-Popup (falls aktiv) zieht, wir zeichnen hier keinen verlinkten Cursor.
+            return;
+        }
+    }
+  */           
+   /*            
+    if state.hover_target.is_some() {
+        println!(
+            "[DEBUG] ABGEBROCHEN: Dieser Plot ({}) hat ein echtes lokales Hover-Target unter der Maus! plot_rect: {:?}", 
+            plot.id, plot_rect
+        );
+        return;
+    } else {
+        println!(
+            "[DEBUG] ZEICHNE INFOBOX: Dieser Plot ({}) hat KEIN lokales Target -> Zeichne verlinkte Infobox! plot_rect: {:?}", 
+            plot.id, plot_rect
+        );
+    }
+*/
+        
+    // --- DEBUG 1: PRÜFEN OB DER FRÜHE ABBRUCH TRAGIERT ---
+  /*  if state.hover.is_some() {
+        println!("[DEBUG] linked_cursor abgebrochen, weil state.hover aktiv ist! plot_rect: {:?}", plot_rect);
+        return;
+    }
+*/
     // Numerisch stabile Transformation über die Mitte der Y-Achse
     let y_center = (transform.viewport().y.min + transform.viewport().y.max) * 0.5;
     let Some(screen_x) = transform
