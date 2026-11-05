@@ -6,12 +6,14 @@ publish = false
 description = "Live plotting library for iced (ported from gpui-liveplot)"
 
 [dependencies]
-iced = { path = "../iced", features = ["canvas", "tokio" ,"advanced"] }
+#iced = { path = "../iced", features = ["canvas", "tokio" ,"advanced"] }
+#iced = { git = "https://github.com", rev = "cd04b74ca", features = ["canvas", "tokio", "advanced"] } # dev version
+iced = { git = "https://github.com/iced-rs/iced", branch = "master", features = ["canvas", "tokio", "advanced"] }
 
 [[bin]]
 name = "basic"
 path = "src/bin/basic.rs"
 
-#[[bin]]
-#name = "advanced"
-#path = "src/bin/advanced.rs"
+[[bin]]
+name = "advanced"
+path = "src/bin/advanced.rs"
