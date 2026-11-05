@@ -216,7 +216,7 @@ fn update(&mut self, message: Message) -> Task<Message> {
                 widget::Message::ResetView => {
                     self.top.with_plot_mut(|plot| { 
                         plot.reset_view(); 
-                        plot.pins_mut().clear(); // HIER ERGÄNZEN: Löscht den Geister-Pin des ersten Klicks!
+                       // plot.pins_mut().clear(); // HIER ERGÄNZEN: Löscht den Geister-Pin des ersten Klicks!
                     });
                     self.bottom.with_plot_mut(|plot| { plot.reset_view(); });
                 }
@@ -234,7 +234,7 @@ fn update(&mut self, message: Message) -> Task<Message> {
                     self.top.with_plot_mut(|plot| { plot.reset_view(); });
                     self.bottom.with_plot_mut(|plot| { 
                         plot.reset_view(); 
-                        plot.pins_mut().clear(); // HIER ERGÄNZEN: Löscht den Geister-Pin des ersten Klicks!
+                       // plot.pins_mut().clear(); // HIER ERGÄNZEN: Löscht den Geister-Pin des ersten Klicks!
                     });
                 }
                 _ => {}
