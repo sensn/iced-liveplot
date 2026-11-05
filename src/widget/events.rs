@@ -142,7 +142,9 @@ fn refresh_layout(program: &Program, state: &mut PlotUiState, bounds: Rectangle)
     state.legend_layout = scratch.legend_layout;
     
     // HIER: Wir stellen sicher, dass der verlinkte Cursor-Fokus permanent erhalten bleibt
+    // HIER ERGÄNZEN: Zustand über Interaktionen hinweg stabil halten!
     state.linked_cursor_x = scratch.linked_cursor_x;
+    state.link_cursor_seq = scratch.link_cursor_seq;
 }
 
 fn handle_mouse_down(
@@ -471,6 +473,20 @@ fn handle_scroll(
             apply_manual_view(program, plot, state, rect, next);
         }
     });
+    
+ // --- THE ABSOLUTE MOUSEWHEEL INFOBOX FIX ---
+    // Nachdem das Scrollrad das Layout verändert hat und das neue `state.transform` feststeht,
+    // rechnen wir die X-Koordinate der Maus sofort neu um und senden sie an den passiven Plot.
+    // Das verhindert, dass die Infobox beim Scrollen einfriert oder verschwindet!
+    if state.regions.hit_test(pos) != HitRegion::Outside {
+        if let (Some(link), Some(transform)) = (program.link_binding(), state.transform.clone()) {
+            if link.options.link_cursor {
+                if let Some(data_point) = transform.screen_to_data(pos) {
+                    link.group.publish_cursor_x(link.member_id, Some(data_point.x));
+                }
+            }
+        }
+    }
 }
 
 /// Zoom factor per scroll amount, mirroring the GPUI backend's

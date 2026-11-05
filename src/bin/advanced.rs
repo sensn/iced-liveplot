@@ -206,11 +206,16 @@ fn update(&mut self, message: Message) -> Task<Message> {
             Task::none()
         }
 
+                // In advanced.rs innerhalb von fn update:
+
         // Nachrichten des OBEREN Plots verarbeiten
         Message::Top(top_msg) => {
             match top_msg {
                 widget::Message::ResetView => {
-                    self.top.with_plot_mut(|plot| { plot.reset_view(); });
+                    self.top.with_plot_mut(|plot| { 
+                        plot.reset_view(); 
+                        plot.pins_mut().clear(); // HIER ERGÄNZEN: Löscht den Geister-Pin des ersten Klicks!
+                    });
                     self.bottom.with_plot_mut(|plot| { plot.reset_view(); });
                 }
                 _ => {}
@@ -225,7 +230,10 @@ fn update(&mut self, message: Message) -> Task<Message> {
             match bottom_msg {
                 widget::Message::ResetView => {
                     self.top.with_plot_mut(|plot| { plot.reset_view(); });
-                    self.bottom.with_plot_mut(|plot| { plot.reset_view(); });
+                    self.bottom.with_plot_mut(|plot| { 
+                        plot.reset_view(); 
+                        plot.pins_mut().clear(); // HIER ERGÄNZEN: Löscht den Geister-Pin des ersten Klicks!
+                    });
                 }
                 _ => {}
             }
@@ -233,6 +241,7 @@ fn update(&mut self, message: Message) -> Task<Message> {
             self.bottom.request_redraw();
             Task::none()
         }
+
     }
 }
 
@@ -241,7 +250,7 @@ fn update(&mut self, message: Message) -> Task<Message> {
 
 
 fn view(&self) -> impl Widget<Message> + use<'_> {
-    let dark_background = iced::Background::Color(iced::Color::from_rgb(0.1, 0.1, 0.12));
+    let dark_background = iced::Background::Color(iced::Color::from_rgb(0.05, 0.05, 0.06));
     
     container(
         column![
