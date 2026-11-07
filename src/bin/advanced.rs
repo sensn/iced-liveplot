@@ -11,7 +11,6 @@ use iced::{Subscription, Task, Widget};
  // use iced::widget::container;
   use iced::widget::{container, column};
 //use iced::Color;
-use iced::widget::mouse_area; // mouse_area importieren
 use iced_liveplot::axis::AxisConfig;
 use iced_liveplot::render::{LineStyle, MarkerShape, MarkerStyle};
 use iced_liveplot::series::{Series, SeriesKind};
@@ -256,23 +255,15 @@ fn view(&self) -> impl Widget<Message> + use<'_> {
     
     container(
         column![
-            // Oberer Plot in eine MouseArea packen
-            mouse_area(
-                iced_liveplot::widget::plot(&self.top)
-                    .height(iced::Length::FillPortion(1))
-                    .map(Message::Top)
-            )
-            // Sendet bei einem echten Doppelklick direkt das Signal an die App
-            .on_double_click(Message::Top(widget::Message::ResetView)), 
+            // Oberer Plot - double-click is now handled internally in the widget
+            iced_liveplot::widget::plot(&self.top)
+                .height(iced::Length::FillPortion(1))
+                .map(Message::Top),
 
-            // Unterer Plot in eine MouseArea packen
-            mouse_area(
-                iced_liveplot::widget::plot(&self.bottom)
-                    .height(iced::Length::FillPortion(1))
-                    .map(Message::Bottom)
-            )
-            // Sendet bei einem echten Doppelklick direkt das Signal an die App
-            .on_double_click(Message::Bottom(widget::Message::ResetView)),
+            // Unterer Plot - double-click is now handled internally in the widget
+            iced_liveplot::widget::plot(&self.bottom)
+                .height(iced::Length::FillPortion(1))
+                .map(Message::Bottom),
         ]
         .spacing(0)
         .width(iced::Length::Fill)

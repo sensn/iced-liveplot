@@ -62,6 +62,25 @@ pub(crate) struct HoverTarget {
     pub(crate) is_pinned: bool,
 }
 
+/// Simple click tracking for double-click detection
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LastClick {
+    pub(crate) position: ScreenPoint,
+    pub(crate) button: Button,
+    pub(crate) time: Instant,
+}
+
+impl LastClick {
+    pub(crate) fn is_double_click(&self, position: ScreenPoint, button: Button, now: Instant) -> bool {
+        if self.button != button {
+            return false;
+        }
+        let distance = ((self.position.x - position.x).powi(2) + (self.position.y - position.y).powi(2)).sqrt();
+        let time_diff = now - self.time;
+        distance <= 6.0 && time_diff.as_millis() <= 300
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SeriesCache {
     pub(crate) key: Option<RenderCacheKey>,
@@ -95,6 +114,8 @@ pub struct PlotUiState {
     pub(crate) selection_rect: Option<ScreenRect>,
     pub(crate) hover: Option<ScreenPoint>,
     pub(crate) last_cursor: Option<ScreenPoint>,
+    /// Previous click for double-click detection
+    pub(crate) last_click: Option<LastClick>,
     pub(crate) linked_cursor_x: Option<f64>,
     pub(crate) linked_brush_x: Option<Range>,
     pub(crate) link_view_seq: u64,
@@ -129,6 +150,7 @@ impl Default for PlotUiState {
             selection_rect: None,
             hover: None,
             last_cursor: None,
+            last_click: None,
             linked_cursor_x: None,
             linked_brush_x: None,
             link_view_seq: 0,
