@@ -179,10 +179,32 @@ pub enum RenderCommand {
         /// Text styling.
         style: TextStyle,
     },
+    /// Draw a path (for complex shapes like diamonds, flags, etc.)
+    Path {
+        /// The path to draw.
+        path: iced::widget::canvas::Path,
+        /// Fill color (None = no fill).
+        fill: Option<Color>,
+        /// Stroke color (None = no stroke).
+        stroke: Option<Color>,
+        /// Stroke width in pixels.
+        stroke_width: f32,
+    },
+}
+
+/// Styling for a filled/stroked path command.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PathStyle {
+    /// Fill color.
+    pub fill: Option<Color>,
+    /// Stroke color.
+    pub stroke: Option<Color>,
+    /// Stroke width.
+    pub stroke_width: f32,
 }
 
 /// Aggregated render commands.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RenderList {
     commands: Vec<RenderCommand>,
 }

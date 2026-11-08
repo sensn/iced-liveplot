@@ -139,6 +139,7 @@ impl Default for PlotUiState {
                 plot: ScreenRect::new(ScreenPoint::new(0.0, 0.0), ScreenPoint::new(0.0, 0.0)),
                 x_axis: ScreenRect::new(ScreenPoint::new(0.0, 0.0), ScreenPoint::new(0.0, 0.0)),
                 y_axis: ScreenRect::new(ScreenPoint::new(0.0, 0.0), ScreenPoint::new(0.0, 0.0)),
+                pins: std::collections::HashSet::new(),
             },
             plot_rect: None,
             transform: None,
@@ -184,5 +185,41 @@ impl PlotUiState {
             }
         }
         None
+    }
+    
+    /// Add a pin to the state
+    pub fn add_pin(&mut self, pin: Pin) {
+        self.regions.pins.insert(pin);
+    }
+    
+    /// Remove a pin from the state
+    pub fn remove_pin(&mut self, series: SeriesId, index: usize) {
+        self.regions.pins.retain(|p| !(p.series == series && p.index == index));
+    }
+    
+    /// Check if a pin exists
+    pub fn has_pin(&self, series: SeriesId, index: usize) -> bool {
+        self.regions.pins.iter().any(|p| p.series == series && p.index == index)
+    }
+    
+    /// Toggle a pin (add if not present, remove if present)
+    pub fn toggle_pin(&mut self, pin: Pin) -> bool {
+        if self.has_pin(pin.series, pin.index) {
+            self.remove_pin(pin.series, pin.index);
+            false
+        } else {
+            self.add_pin(pin);
+            true
+        }
+    }
+    
+    /// Get all pins
+    pub fn pins(&self) -> &std::collections::HashSet<Pin> {
+        &self.regions.pins
+    }
+    
+    /// Get mutable pins
+    pub fn pins_mut(&mut self) -> &mut std::collections::HashSet<Pin> {
+        &mut self.regions.pins
     }
 }

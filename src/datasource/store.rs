@@ -83,7 +83,12 @@ impl SeriesStore {
     pub fn data(&self) -> &AppendOnlyData {
         &self.data
     }
-
+    
+    /// Access the underlying data mutably.
+    pub fn data_mut(&mut self) -> &mut AppendOnlyData {
+        &mut self.data
+    }
+    
     /// Access the series bounds.
     pub fn bounds(&self) -> Option<crate::view::Viewport> {
         self.data.bounds()
@@ -93,7 +98,25 @@ impl SeriesStore {
     pub fn generation(&self) -> u64 {
         self.generation
     }
-
+    
+    /// Insert points at the given index.
+    pub fn insert_points(&mut self, index: usize, points: &[Point]) {
+        self.data.insert_points(index, points);
+        self.update_summary_from(index);
+    }
+    
+    /// Remove points from the given range.
+    pub fn remove_points(&mut self, start: usize, count: usize) {
+        self.data.remove_points(start, count);
+        self.update_summary_from(start);
+    }
+    
+    /// Set a point at the given index.
+    pub fn set_point(&mut self, index: usize, point: Point) {
+        self.data.set_point(index, point);
+        self.update_summary_from(index);
+    }
+    
     /// Decimate data for rendering within an X range and pixel width.
     pub fn decimate<'a>(
         &self,

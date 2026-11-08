@@ -2,15 +2,20 @@
 //! translates mouse events into plot interactions (pan, zoom, pins, hover,
 //! box-select, legend toggles).
 
+pub mod actions;
 pub mod config;
 pub mod constants;
+pub mod dispatcher;
 pub mod frame;
 pub mod geometry;
+pub mod history;
 pub mod hover;
+pub mod keybindings;
 pub mod link;
 pub mod paint;
 pub mod state;
 pub mod text;
+pub mod tools;
 
 mod events;
 
@@ -22,15 +27,19 @@ use iced::Rectangle;
 
 use crate::plot::Plot;
 use crate::style::Theme;
+use crate::widget::actions::{ActionDispatcher, Clipboard};
 
 pub use config::PlotViewConfig;
 use state::PlotUiState;
 // linking
 use crate::widget::link::PlotLinkOptions;
 use crate::widget::link::{PlotLinkGroup, LinkBinding};
+pub use actions::PlotAction;
+pub use keybindings::{KeyBindings, StandardAction};
+pub use tools::{Tool, ToolRegistry, ToolState};
 
 /// A message produced by the plot widget.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Message {
     /// Live data tick (from a `time::every` subscription) — refresh and
     /// redraw.

@@ -129,8 +129,8 @@ fn find_nearest_unpinned_point(
                     continue;
                 };
                 let pin = crate::interaction::Pin {
-                    series_id: series.id(),
-                    point_index: index,
+                    series: series.id(),
+                    index,
                 };
                 if pins.contains(&pin) {
                     continue;
@@ -171,10 +171,10 @@ fn pin_screen_point(
     let series = plot
         .series()
         .iter()
-        .find(|series| series.id() == pin.series_id)?;
+        .find(|series| series.id() == pin.series)?;
     if !series.is_visible() {
         return None;
     }
-    let point = series.with_store(|store| store.data().point(pin.point_index))?;
+    let point = series.with_store(|store| store.data().point(pin.index))?;
     transform.data_to_screen(point)
 }

@@ -75,6 +75,14 @@ fn paint_one(frame: &mut canvas::Frame, command: &RenderCommand) {
             text,
             style,
         } => paint_text(frame, position, text, style),
+        RenderCommand::Path { path, fill, stroke, stroke_width } => {
+            if let Some(fill) = fill {
+                frame.fill(path, *fill);
+            }
+            if let Some(stroke) = stroke {
+                frame.stroke(path, canvas::Stroke::default().with_color(*stroke).with_width(*stroke_width));
+            }
+        }
     }
 }
 

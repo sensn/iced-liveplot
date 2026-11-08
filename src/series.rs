@@ -2,6 +2,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+use serde::{Deserialize, Serialize};
 
 use crate::datasource::{AppendError, AppendOnlyData, SeriesStore};
 use crate::geom::Point;
@@ -14,7 +15,7 @@ static SERIES_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 ///
 /// Series IDs are stable within a process and are used to bind pins to
 /// specific series and point indices.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SeriesId(u64);
 
 impl SeriesId {
@@ -204,6 +205,32 @@ impl Series {
         self.with_store_mut(|data| data.extend_points(points))
     }
 
+    /// Access all points as a slice.
+    pub fn points(&self) -> Vec<Point> {
+        self.with_store(|store| store.data().points().to_vec())
+    }
+    
+    /// Insert points at the given index.
+    pub fn insert_points(&mut self, index: usize, points: &[Point]) {
+        self.with_store_mut(|store| {
+            store.insert_points(index, points);
+        });
+    }
+    
+    /// Remove points from the given range.
+    pub fn remove_points(&mut self, start: usize, count: usize) {
+        self.with_store_mut(|store| {
+            store.remove_points(start, count);
+        });
+    }
+    
+    /// Set a point at the given index.
+    pub fn set_point(&mut self, index: usize, point: Point) {
+        self.with_store_mut(|store| {
+            store.set_point(index, point);
+        });
+    }
+    
     /// Access the series bounds.
     pub fn bounds(&self) -> Option<Viewport> {
         self.with_store(SeriesStore::bounds)

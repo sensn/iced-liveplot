@@ -22,7 +22,7 @@ pub enum HitRegion {
 }
 
 /// Screen regions for hit testing.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PlotRegions {
     /// Plot data area.
     pub plot: ScreenRect,
@@ -30,6 +30,8 @@ pub struct PlotRegions {
     pub x_axis: ScreenRect,
     /// Y axis area.
     pub y_axis: ScreenRect,
+    /// Pins in the plot region.
+    pub pins: std::collections::HashSet<Pin>,
 }
 
 impl PlotRegions {
@@ -51,12 +53,12 @@ impl PlotRegions {
 ///
 /// Pins are stable references to a specific series and point index, allowing
 /// annotations to remain consistent even when the view is decimated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Pin {
     /// Series identifier.
-    pub series_id: SeriesId,
+    pub series: SeriesId,
     /// Point index within the series.
-    pub point_index: usize,
+    pub index: usize,
 }
 
 /// Toggle a pin in the list. Returns true if added, false if removed.
@@ -140,6 +142,7 @@ mod tests {
             plot: ScreenRect::new(ScreenPoint::new(0.0, 0.0), ScreenPoint::new(10.0, 10.0)),
             x_axis: ScreenRect::new(ScreenPoint::new(0.0, 10.0), ScreenPoint::new(10.0, 12.0)),
             y_axis: ScreenRect::new(ScreenPoint::new(-2.0, 0.0), ScreenPoint::new(0.0, 10.0)),
+            pins: std::collections::HashSet::new(),
         };
         assert_eq!(
             regions.hit_test(ScreenPoint::new(5.0, 5.0)),

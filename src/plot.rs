@@ -5,6 +5,7 @@
 
 use crate::axis::AxisConfig;
 use crate::interaction::Pin;
+use crate::region::{DataRegion, RegionId};
 use crate::series::Series;
 use crate::style::Theme;
 use crate::view::{Range, View, Viewport};
@@ -23,8 +24,9 @@ pub struct Plot {
     viewport: Option<Viewport>,
     series: Vec<Series>,
     pins: Vec<Pin>,
-    pub(crate) id: String, // <- Neu hinzufügen
-    pub(crate) is_mouse_actively_inside: bool, // <-- HIER ERGÄNZEN!
+    regions: Vec<DataRegion>,
+    pub(crate) id: String,
+    pub(crate) is_mouse_actively_inside: bool,
 }
 
 impl Plot {
@@ -40,9 +42,9 @@ impl Plot {
             viewport: None,
             series: Vec::new(),
             pins: Vec::new(),
-            id: String::new(), // <- Hier initialisieren
+            regions: Vec::new(),
+            id: String::new(),
             is_mouse_actively_inside: false,
-       
         }
     }
      // Falls du eine Getter-Methode brauch hergeben willst:
@@ -116,6 +118,30 @@ impl Plot {
     /// Access the pinned points mutably.
     pub fn pins_mut(&mut self) -> &mut Vec<Pin> {
         &mut self.pins
+    }
+
+    /// Access the regions.
+    pub fn regions(&self) -> &[DataRegion] {
+        &self.regions
+    }
+
+    /// Access the regions mutably.
+    pub fn regions_mut(&mut self) -> &mut Vec<DataRegion> {
+        &mut self.regions
+    }
+
+    /// Add a region to the plot.
+    pub fn add_region(&mut self, region: DataRegion) -> RegionId {
+        let id = region.id;
+        self.regions.push(region);
+        id
+    }
+
+    /// Remove a region by ID.
+    pub fn remove_region(&mut self, id: RegionId) -> bool {
+        let len = self.regions.len();
+        self.regions.retain(|r| r.id != id);
+        self.regions.len() != len
     }
 
     /// Compute bounds across all visible series.
@@ -319,9 +345,9 @@ impl PlotBuilder {
             viewport: None,
             series: self.series,
             pins: Vec::new(),
-            id: self.id, // <- Neu weiterreichen
+            regions: Vec::new(),
+            id: self.id,
             is_mouse_actively_inside: false,
-
         }
     }
 }

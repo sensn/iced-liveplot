@@ -185,7 +185,12 @@ impl AppendOnlyData {
     pub fn points(&self) -> &[Point] {
         &self.points
     }
-
+    
+    /// Access all points as a mutable slice.
+    pub fn points_mut(&mut self) -> &mut [Point] {
+        &mut self.points
+    }
+    
     /// Access a single point by index.
     pub fn point(&self, index: usize) -> Option<Point> {
         self.points.get(index).copied()
@@ -215,7 +220,45 @@ impl AppendOnlyData {
     pub fn is_monotonic(&self) -> bool {
         self.monotonic
     }
-
+    
+    /// Insert points at the given index.
+    pub fn insert_points(&mut self, index: usize, points: &[Point]) {
+        if index > self.points.len() {
+            return;
+        }
+        let mut new_points = Vec::with_capacity(self.points.len() + points.len());
+        new_points.extend_from_slice(&self.points[..index]);
+        new_points.extend_from_slice(points);
+        new_points.extend_from_slice(&self.points[index..]);
+        self.points = new_points;
+        self.rebuild_bounds();
+    }
+    
+    /// Remove points from the given range.
+    pub fn remove_points(&mut self, start: usize, count: usize) {
+        let end = (start + count).min(self.points.len());
+        if start < end {
+            self.points.drain(start..end);
+            self.rebuild_bounds();
+        }
+    }
+    
+    /// Set a point at the given index.
+    pub fn set_point(&mut self, index: usize, point: Point) {
+        if index < self.points.len() {
+            self.points[index] = point;
+            self.rebuild_bounds();
+        }
+    }
+    
+    /// Recompute bounds from all points.
+    fn rebuild_bounds(&mut self) {
+        self.bounds = None;
+        for point in self.points.clone() {
+            self.update_bounds(point);
+        }
+    }
+    
     /// Find the index range that intersects the X range.
     pub fn range_by_x(&self, range: Range) -> std::ops::Range<usize> {
         if self.points.is_empty() {

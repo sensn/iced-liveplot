@@ -1,12 +1,14 @@
 use std::cmp::Ordering;
 
 
-use iced::Color;
-use iced::Rectangle;
+use iced::{Color, Rectangle};
+use iced::widget::canvas::{Fill, Stroke, Path};
+use iced::Point as IcedPoint;
 
 use crate::axis::{AxisConfig, AxisLayout, TextMeasurer};
 use crate::geom::{Point as DataPoint, ScreenPoint, ScreenRect};
 use crate::plot::Plot;
+use crate::region::{DataRegion, RegionId, RegionKind, RegionStyle, LabelPosition, SerializableColor};
 use crate::render::{
     RenderCommand, LineSegment, LineStyle, MarkerShape, MarkerStyle, RectStyle,
     RenderCacheKey, RenderList, TextStyle, build_line_segments, build_scatter_points,
@@ -122,6 +124,7 @@ pub(crate) fn build_frame(
         plot: plot_rect,
         x_axis: x_axis_rect,
         y_axis: y_axis_rect,
+        pins: std::collections::HashSet::new(),
     };
     state.plot_rect = Some(plot_rect);
 
@@ -140,6 +143,7 @@ pub(crate) fn build_frame(
         build_series(&mut render, plot, state, &transform, plot_rect);
         build_linked_brush(&mut render, plot, state, &transform, plot_rect);
         build_selection(&mut render, plot, state);
+        build_regions(&mut render, plot, &transform, plot_rect, &measurer);
         update_hover_target(
             plot,
             state,
@@ -410,14 +414,14 @@ fn build_pins(
         let Some(series) = plot
             .series()
             .iter()
-            .find(|series| series.id() == pin.series_id)
+            .find(|series| series.id() == pin.series)
         else {
             continue;
         };
         if !series.is_visible() {
             continue;
         }
-        let Some(point) = series.with_store(|store| store.data().point(pin.point_index)) else {
+        let Some(point) = series.with_store(|store| store.data().point(pin.index)) else {
             continue;
         };
         let Some(screen) = transform.data_to_screen(point) else {
@@ -592,6 +596,363 @@ fn build_pins(
         }
     }
 
+    render.push(RenderCommand::ClipEnd);
+}
+
+// ========================================================================
+// Region rendering
+// ========================================================================
+
+fn build_regions(
+    render: &mut RenderList,
+    plot: &Plot,
+    transform: &Transform,
+    plot_rect: ScreenRect,
+    measurer: &EstimatedTextMeasurer,
+) {
+    let theme = plot.theme();
+    
+    // Check if plot has regions
+    if plot.regions().is_empty() {
+        return;
+    }
+    
+    render.push(RenderCommand::ClipRect(plot_rect));
+    
+    for region in plot.regions() {
+        if !region.visible {
+            continue;
+        }
+        
+        // Get screen bounds for this region
+        let Some(screen_bounds) = region.screen_bounds(transform) else {
+            continue;
+        };
+        
+        // Clip to plot rect
+        let min_x = screen_bounds.min.x.max(plot_rect.min.x);
+        let min_y = screen_bounds.min.y.max(plot_rect.min.y);
+        let max_x = screen_bounds.max.x.min(plot_rect.max.x);
+        let max_y = screen_bounds.max.y.min(plot_rect.max.y);
+        
+        if min_x >= max_x || min_y >= max_y {
+            continue;
+        }
+        
+        let clipped_bounds = ScreenRect::new(
+            ScreenPoint::new(min_x, min_y),
+            ScreenPoint::new(max_x, max_y),
+        );
+        
+        
+        // Get region style
+        let fill_color = region.style.fill.unwrap_or(match &region.kind {
+            crate::region::RegionKind::MidiNote { .. } => SerializableColor::new(0.4, 0.6, 1.0, 0.7),
+            crate::region::RegionKind::AudioRegion { .. } => SerializableColor::new(0.6, 0.8, 0.4, 0.6),
+            crate::region::RegionKind::AutomationPoint { .. } => SerializableColor::new(1.0, 0.6, 0.2, 0.9),
+            crate::region::RegionKind::Marker { color, .. } => *color,
+            crate::region::RegionKind::Loop { .. } => SerializableColor::new(1.0, 0.8, 0.0, 0.3),
+            _ => return, // skip if no fill
+        }).to_iced();
+        
+        let stroke_color = region.style.stroke.unwrap_or_else(|| SerializableColor::from_iced(theme.selection_border)).to_iced();
+        let stroke_width = region.style.stroke_width;
+        
+        // Draw region based on kind
+        match &region.kind {
+            crate::region::RegionKind::MidiNote { pitch, velocity, channel, .. } => {
+                // MIDI note as rectangle
+                render.push(RenderCommand::Rect {
+                    rect: clipped_bounds,
+                    style: RectStyle {
+                        fill: fill_color,
+                        stroke: stroke_color,
+                        stroke_width,
+                    },
+                });
+                
+                // Velocity indicator (top bar)
+                let vel_height = (clipped_bounds.height() * *velocity as f32 / 127.0).max(1.0);
+                let vel_rect = ScreenRect::new(
+                    ScreenPoint::new(clipped_bounds.min.x, clipped_bounds.max.y - vel_height),
+                    ScreenPoint::new(clipped_bounds.max.x, clipped_bounds.max.y),
+                );
+                render.push(RenderCommand::Rect {
+                    rect: vel_rect,
+                    style: RectStyle {
+                        fill: Color::WHITE,
+                        stroke: Color::TRANSPARENT,
+                        stroke_width: 0.0,
+                    },
+                });
+                
+                // Channel indicator (small colored bar)
+                if *channel > 0 {
+                    let chan_colors = [
+                        SerializableColor::new(1.0, 0.0, 0.0, 1.0),
+                        SerializableColor::new(1.0, 0.5, 0.0, 1.0),
+                        SerializableColor::new(1.0, 1.0, 0.0, 1.0),
+                        SerializableColor::new(0.0, 1.0, 0.0, 1.0),
+                        SerializableColor::new(0.0, 1.0, 1.0, 1.0),
+                        SerializableColor::new(0.0, 0.5, 1.0, 1.0),
+                        SerializableColor::new(0.0, 0.0, 1.0, 1.0),
+                        SerializableColor::new(0.5, 0.0, 1.0, 1.0),
+                        SerializableColor::new(1.0, 0.0, 1.0, 1.0),
+                        SerializableColor::new(1.0, 0.0, 0.5, 1.0),
+                        SerializableColor::new(0.5, 0.5, 0.5, 1.0),
+                        SerializableColor::new(1.0, 1.0, 1.0, 1.0),
+                        SerializableColor::new(0.0, 0.0, 0.0, 1.0),
+                        SerializableColor::new(1.0, 0.5, 0.5, 1.0),
+                        SerializableColor::new(0.5, 1.0, 0.5, 1.0),
+                        SerializableColor::new(0.5, 0.5, 1.0, 1.0),
+                    ];
+                    let chan_color = chan_colors[*channel as usize % chan_colors.len()];
+                    let chan_rect = ScreenRect::new(
+                        ScreenPoint::new(clipped_bounds.min.x, clipped_bounds.min.y),
+                        ScreenPoint::new(clipped_bounds.min.x + 3.0, clipped_bounds.max.y),
+                    );
+                    render.push(RenderCommand::Rect {
+                        rect: chan_rect,
+                        style: RectStyle {
+                            fill: chan_color.to_iced(),
+                            stroke: Color::TRANSPARENT,
+                            stroke_width: 0.0,
+                        },
+                    });
+                }
+            }
+            crate::region::RegionKind::AudioRegion { fade_in, fade_out, .. } => {
+                // Audio region as rectangle with fade handles
+                render.push(RenderCommand::Rect {
+                    rect: clipped_bounds,
+                    style: RectStyle {
+                        fill: fill_color,
+                        stroke: stroke_color,
+                        stroke_width,
+                    },
+                });
+                
+                // Draw fade in/out indicators
+                let region_width = clipped_bounds.width();
+                if *fade_in > 0.0 {
+                    let fade_width = (region_width * *fade_in as f32).min(region_width / 2.0);
+                    let fade_rect = ScreenRect::new(
+                        ScreenPoint::new(clipped_bounds.min.x, clipped_bounds.min.y),
+                        ScreenPoint::new(clipped_bounds.min.x + fade_width, clipped_bounds.max.y),
+                    );
+                    render.push(RenderCommand::Rect {
+                        rect: fade_rect,
+                        style: RectStyle {
+                            fill: Color::from_rgba(1.0, 1.0, 1.0, 0.2),
+                            stroke: Color::TRANSPARENT,
+                            stroke_width: 0.0,
+                        },
+                    });
+                }
+                if *fade_out > 0.0 {
+                    let fade_width = (region_width * *fade_out as f32).min(region_width / 2.0);
+                    let fade_rect = ScreenRect::new(
+                        ScreenPoint::new(clipped_bounds.max.x - fade_width, clipped_bounds.min.y),
+                        ScreenPoint::new(clipped_bounds.max.x, clipped_bounds.max.y),
+                    );
+                    render.push(RenderCommand::Rect {
+                        rect: fade_rect,
+                        style: RectStyle {
+                            fill: Color::from_rgba(1.0, 1.0, 1.0, 0.2),
+                            stroke: Color::TRANSPARENT,
+                            stroke_width: 0.0,
+                        },
+                    });
+                }
+            }
+            crate::region::RegionKind::AutomationPoint { parameter, value, .. } => {
+                // Automation point as diamond/circle
+                let center_x = (clipped_bounds.min.x + clipped_bounds.max.x) / 2.0;
+                let center_y = (clipped_bounds.min.y + clipped_bounds.max.y) / 2.0;
+                let radius = 6.0;
+                
+                // Draw diamond shape for automation points
+                let mut builder = iced::widget::canvas::path::Builder::new();
+                builder.move_to(iced::Point::new(center_x, center_y - radius));
+                builder.line_to(iced::Point::new(center_x + radius, center_y));
+                builder.line_to(iced::Point::new(center_x, center_y + radius));
+                builder.line_to(iced::Point::new(center_x - radius, center_y));
+                builder.close();
+                let diamond = builder.build();
+                render.push(RenderCommand::Path {
+                    path: diamond,
+                    fill: Some(fill_color),
+                    stroke: Some(stroke_color),
+                    stroke_width,
+                });
+            }
+            crate::region::RegionKind::Marker { label, color, .. } => {
+                // Marker as triangle flag
+                let flag_width = 80.0;
+                let flag_height = 20.0;
+                
+                let mut builder = iced::widget::canvas::path::Builder::new();
+                builder.move_to(iced::Point::new(clipped_bounds.min.x, clipped_bounds.max.y));
+                builder.line_to(iced::Point::new(clipped_bounds.min.x + flag_width, clipped_bounds.max.y - flag_height / 2.0));
+                builder.line_to(iced::Point::new(clipped_bounds.min.x, clipped_bounds.min.y));
+                builder.close();
+                let flag = builder.build();
+                let marker_color = color.to_iced();
+                render.push(RenderCommand::Path {
+                    path: flag,
+                    fill: Some(marker_color),
+                    stroke: Some(Color::WHITE),
+                    stroke_width: 1.0,
+                });
+                // Draw label
+                if let Some(label_text) = &region.style.label {
+                    let text = iced::widget::canvas::Text {
+                        content: label_text.clone(),
+                        position: IcedPoint::new(clipped_bounds.min.x + 4.0, clipped_bounds.min.y + 2.0),
+                        color: region.style.label_color.unwrap_or(SerializableColor::WHITE).to_iced(),
+                        size: iced::Pixels(10.0),
+                        ..Default::default()
+                    };
+                    render.push(RenderCommand::Text {
+                        position: ScreenPoint::new(clipped_bounds.min.x + 4.0, clipped_bounds.min.y + 2.0),
+                        text: label_text.clone(),
+                        style: TextStyle {
+                            color: region.style.label_color.unwrap_or(SerializableColor::WHITE).to_iced(),
+                            size: 10.0,
+                        },
+                    });
+                }
+            }
+            crate::region::RegionKind::Loop { .. } => {
+                // Loop as bracket with label
+                render.push(RenderCommand::Rect {
+                    rect: clipped_bounds,
+                    style: RectStyle {
+                        fill: fill_color,
+                        stroke: stroke_color,
+                        stroke_width: 2.0,
+                    },
+                });
+                
+                // Draw bracket ends
+                let bracket_size = 8.0;
+                let left_bracket = ScreenRect::new(
+                    ScreenPoint::new(clipped_bounds.min.x, clipped_bounds.min.y),
+                    ScreenPoint::new(clipped_bounds.min.x + bracket_size, clipped_bounds.max.y),
+                );
+                let right_bracket = ScreenRect::new(
+                    ScreenPoint::new(clipped_bounds.max.x - bracket_size, clipped_bounds.min.y),
+                    ScreenPoint::new(clipped_bounds.max.x, clipped_bounds.max.y),
+                );
+                render.push(RenderCommand::Rect {
+                    rect: left_bracket,
+                    style: RectStyle {
+                        fill: stroke_color,
+                        stroke: Color::TRANSPARENT,
+                        stroke_width: 0.0,
+                    },
+                });
+                render.push(RenderCommand::Rect {
+                    rect: right_bracket,
+                    style: RectStyle {
+                        fill: stroke_color,
+                        stroke: Color::TRANSPARENT,
+                        stroke_width: 0.0,
+                    },
+                });
+            }
+            _ => {
+                // Generic rectangle for other region types
+                render.push(RenderCommand::Rect {
+                    rect: clipped_bounds,
+                    style: RectStyle {
+                        fill: fill_color,
+                        stroke: stroke_color,
+                        stroke_width,
+                    },
+                });
+            }
+        }
+        
+        // Draw selection highlight
+        if region.selected {
+            let highlight_bounds = ScreenRect::new(
+                ScreenPoint::new(clipped_bounds.min.x - 2.0, clipped_bounds.min.y - 2.0),
+                ScreenPoint::new(clipped_bounds.max.x + 2.0, clipped_bounds.max.y + 2.0),
+            );
+            render.push(RenderCommand::Rect {
+                rect: highlight_bounds,
+                style: RectStyle {
+                    fill: Color::TRANSPARENT,
+                    stroke: SerializableColor::new(1.0, 0.8, 0.2, 1.0).to_iced(),
+                    stroke_width: 2.0,
+                },
+            });
+            
+            // Draw selection handles
+            let handle_size = 6.0;
+            let handles = [
+                // Corners
+                (clipped_bounds.min.x, clipped_bounds.min.y), // TL
+                (clipped_bounds.max.x, clipped_bounds.min.y), // TR
+                (clipped_bounds.min.x, clipped_bounds.max.y), // BL
+                (clipped_bounds.max.x, clipped_bounds.max.y), // BR
+                // Edges
+                ((clipped_bounds.min.x + clipped_bounds.max.x) / 2.0, clipped_bounds.min.y), // Top
+                ((clipped_bounds.min.x + clipped_bounds.max.x) / 2.0, clipped_bounds.max.y), // Bottom
+                (clipped_bounds.min.x, (clipped_bounds.min.y + clipped_bounds.max.y) / 2.0), // Left
+                (clipped_bounds.max.x, (clipped_bounds.min.y + clipped_bounds.max.y) / 2.0), // Right
+            ];
+            
+            for (hx, hy) in handles {
+                let handle_rect = ScreenRect::new(
+                    ScreenPoint::new(hx - handle_size / 2.0, hy - handle_size / 2.0),
+                    ScreenPoint::new(hx + handle_size / 2.0, hy + handle_size / 2.0),
+                );
+                render.push(RenderCommand::Rect {
+                    rect: handle_rect,
+                    style: RectStyle {
+                        fill: Color::WHITE,
+                        stroke: SerializableColor::new(1.0, 0.6, 0.0, 1.0).to_iced(),
+                        stroke_width: 1.5,
+                    },
+                });
+            }
+        }
+        
+        // Draw region label
+        if let Some(label_text) = &region.style.label {
+            let label_pos = match region.style.label_position {
+                LabelPosition::TopLeft => ScreenPoint::new(clipped_bounds.min.x + 4.0, clipped_bounds.min.y + 2.0),
+                LabelPosition::TopCenter => ScreenPoint::new(
+                    (clipped_bounds.min.x + clipped_bounds.max.x) / 2.0 - 20.0,
+                    clipped_bounds.min.y + 2.0
+                ),
+                LabelPosition::TopRight => ScreenPoint::new(clipped_bounds.max.x - 40.0, clipped_bounds.min.y + 2.0),
+                LabelPosition::Center => ScreenPoint::new(
+                    (clipped_bounds.min.x + clipped_bounds.max.x) / 2.0 - 20.0,
+                    (clipped_bounds.min.y + clipped_bounds.max.y) / 2.0 - 7.0
+                ),
+                LabelPosition::BottomLeft => ScreenPoint::new(clipped_bounds.min.x + 4.0, clipped_bounds.max.y - 16.0),
+                LabelPosition::BottomCenter => ScreenPoint::new(
+                    (clipped_bounds.min.x + clipped_bounds.max.x) / 2.0 - 20.0,
+                    clipped_bounds.max.y - 16.0
+                ),
+                LabelPosition::BottomRight => ScreenPoint::new(clipped_bounds.max.x - 40.0, clipped_bounds.max.y - 16.0),
+            };
+            
+            let label_color = region.style.label_color.unwrap_or_else(|| SerializableColor::from_iced(theme.axis));
+            render.push(RenderCommand::Text {
+                position: label_pos,
+                text: label_text.clone(),
+                style: TextStyle {
+                    color: label_color.to_iced(),
+                    size: 10.0,
+                },
+            });
+        }
+    }
+    
     render.push(RenderCommand::ClipEnd);
 }
 
@@ -959,11 +1320,11 @@ fn build_hover(
         let Some(series) = plot
             .series()
             .iter()
-            .find(|series| series.id() == target.pin.series_id)
+            .find(|series| series.id() == target.pin.series)
         else {
             return;
         };
-        let Some(point) = series.with_store(|store| store.data().point(target.pin.point_index))
+        let Some(point) = series.with_store(|store| store.data().point(target.pin.index))
         else {
             return;
         };

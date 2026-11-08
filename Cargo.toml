@@ -10,6 +10,11 @@ description = "Live plotting library for iced (ported from gpui-liveplot)"
 iced = { git = "https://github.com/iced-rs/iced", branch = "master", features = ["canvas", "tokio", "advanced"] }
 #iced = { git = "https://github.com/iced-rs/iced", rev = "cd04b74ca", features = ["canvas", "tokio", "advanced"] } # dev version
 
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rand = "0.8"
+
 
 [[bin]]
 name = "basic"
@@ -18,3 +23,7 @@ path = "src/bin/basic.rs"
 [[bin]]
 name = "advanced"
 path = "src/bin/advanced.rs"
+
+[[bin]]
+name = "advanced_future_directions"
+path = "src/bin/advanced_future_directions.rs"
