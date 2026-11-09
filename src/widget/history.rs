@@ -52,7 +52,7 @@ impl History {
     pub fn execute<A: PlotAction + 'static>(&mut self, action: A, plot: &mut Plot, state: &mut PlotUiState, config: &PlotViewConfig, clipboard: &mut Clipboard) -> crate::widget::actions::ActionResult {
         let mut ctx = ActionContext {
             plot,
-            state,
+            state: Some(state),
             clipboard,
             history: None,
             config,
@@ -71,7 +71,7 @@ impl History {
     pub fn undo(&mut self, plot: &mut Plot, state: &mut PlotUiState, config: &PlotViewConfig, clipboard: &mut Clipboard) -> Option<crate::widget::actions::ActionResult> {
         let mut ctx = ActionContext {
             plot,
-            state,
+            state: Some(state),
             clipboard,
             history: None,
             config,
@@ -91,7 +91,7 @@ impl History {
     pub fn redo(&mut self, plot: &mut Plot, state: &mut PlotUiState, config: &PlotViewConfig, clipboard: &mut Clipboard) -> Option<crate::widget::actions::ActionResult> {
         let mut ctx = ActionContext {
             plot,
-            state,
+            state: Some(state),
             clipboard,
             history: None,
             config,

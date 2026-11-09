@@ -46,7 +46,7 @@ impl Dispatcher {
     pub fn execute<A: PlotAction + 'static>(&mut self, action: A, parts: CtxParts<'_>) -> ActionResult {
         let mut ctx = ActionContext {
             plot: parts.plot,
-            state: parts.state,
+            state: Some(parts.state),
             clipboard: parts.clipboard,
             history: None,
             config: parts.config,
@@ -57,7 +57,7 @@ impl Dispatcher {
     pub fn undo(&mut self, parts: CtxParts<'_>) -> Option<ActionResult> {
         let mut ctx = ActionContext {
             plot: parts.plot,
-            state: parts.state,
+            state: Some(parts.state),
             clipboard: parts.clipboard,
             history: None,
             config: parts.config,
@@ -68,7 +68,7 @@ impl Dispatcher {
     pub fn redo(&mut self, parts: CtxParts<'_>) -> Option<ActionResult> {
         let mut ctx = ActionContext {
             plot: parts.plot,
-            state: parts.state,
+            state: Some(parts.state),
             clipboard: parts.clipboard,
             history: None,
             config: parts.config,

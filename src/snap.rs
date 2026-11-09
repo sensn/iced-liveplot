@@ -223,6 +223,7 @@ pub enum SnapType {
 }
 
 /// Snap engine
+#[derive(Clone)]
 pub struct SnapEngine {
     config: SnapConfig,
     /// Cached grid lines for current view

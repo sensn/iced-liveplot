@@ -50,8 +50,9 @@ pub enum ActionResult {
 pub struct ActionContext<'a> {
     /// The plot being modified.
     pub plot: &'a mut Plot,
-    /// The UI state for pins, hover, etc.
-    pub state: &'a mut PlotUiState,
+    /// The UI state for pins, hover, etc. (optional: widget event state may
+    /// not be available outside the canvas draw/event cycle).
+    pub state: Option<&'a mut PlotUiState>,
     /// The clipboard for copy/paste.
     pub clipboard: &'a mut Clipboard,
     /// The history group for batching actions.
@@ -145,7 +146,7 @@ impl PlotAction for AddPin {
                 series: self.series,
                 index: self.index,
             };
-            ctx.state.add_pin(pin);
+            ctx.plot.pins_mut().push(pin);
             ActionResult::Redraw
         } else {
             ActionResult::Error(ActionError::InvalidParameters("Index out of bounds"))
@@ -157,7 +158,7 @@ impl PlotAction for AddPin {
     }
     
     fn undo(&self, ctx: &mut ActionContext<'_>) -> ActionResult {
-        ctx.state.remove_pin(self.series, self.index);
+        ctx.plot.pins_mut().retain(|p| !(p.series == self.series && p.index == self.index));
         ActionResult::Redraw
     }
 }
@@ -174,7 +175,7 @@ impl PlotAction for RemovePin {
     }
     
     fn execute(&self, ctx: &mut ActionContext<'_>) -> ActionResult {
-        ctx.state.remove_pin(self.pin.series, self.pin.index);
+        ctx.plot.pins_mut().retain(|p| *p != self.pin);
         ActionResult::Redraw
     }
     
@@ -183,7 +184,7 @@ impl PlotAction for RemovePin {
     }
     
     fn undo(&self, ctx: &mut ActionContext<'_>) -> ActionResult {
-        ctx.state.add_pin(self.pin);
+        ctx.plot.pins_mut().push(self.pin);
         ActionResult::Redraw
     }
 }
@@ -200,7 +201,7 @@ impl PlotAction for TogglePin {
     }
     
     fn execute(&self, ctx: &mut ActionContext<'_>) -> ActionResult {
-        let was_added = ctx.state.toggle_pin(self.pin);
+        crate::interaction::toggle_pin(ctx.plot.pins_mut(), self.pin);
         ActionResult::Redraw
     }
     
@@ -209,7 +210,7 @@ impl PlotAction for TogglePin {
     }
     
     fn undo(&self, ctx: &mut ActionContext<'_>) -> ActionResult {
-        ctx.state.toggle_pin(self.pin);
+        crate::interaction::toggle_pin(ctx.plot.pins_mut(), self.pin);
         ActionResult::Redraw
     }
 }
@@ -517,6 +518,44 @@ impl ActionDispatcher {
         self
     }
 
+    /// Execute a pre-erased action (dyn-compatible entry point).
+    pub fn execute_dyn(&mut self, action: Arc<dyn PlotAction>, ctx: &mut ActionContext<'_>) -> ActionResult {
+        let now = Instant::now();
+        let can_group = if let Some(start) = self.group_start {
+            now.duration_since(start) <= self.group_window
+        } else {
+            false
+        };
+
+        if action.can_undo() {
+            if can_group && self.current_group.is_some() {
+                if let Some(ref mut group) = self.current_group {
+                    group.add_action(action.clone());
+                }
+            } else {
+                let mut group = HistoryGroup::new(action.name().to_string());
+                group.add_action(action.clone());
+                self.current_group = Some(group);
+                self.group_start = Some(now);
+            }
+        }
+
+        let result = action.execute(ctx);
+
+        if action.can_undo() {
+            if let Some(group) = self.current_group.take() {
+                self.history.push(group);
+                if self.history.len() > self.max_history {
+                    self.history.remove(0);
+                }
+                self.redo_stack.clear();
+                self.group_start = None;
+            }
+        }
+
+        result
+    }
+
     pub fn execute<A: PlotAction + 'static>(&mut self, action: Arc<A>, ctx: &mut ActionContext<'_>) -> ActionResult {
         // Check if we should start a new group or add to current
         let now = Instant::now();
@@ -634,9 +673,10 @@ mod tests {
         let mut clipboard = Clipboard::default();
         let config = PlotViewConfig::default();
         
+        let _ = &mut state;
         let mut ctx = ActionContext {
             plot: &mut plot,
-            state: &mut state,
+            state: None,
             clipboard: &mut clipboard,
             history: None,
             config: &config,
@@ -662,9 +702,10 @@ mod tests {
         let mut clipboard = Clipboard::default();
         let config = PlotViewConfig::default();
         
+        let _ = &mut state;
         let mut ctx = ActionContext {
             plot: &mut plot,
-            state: &mut state,
+            state: None,
             clipboard: &mut clipboard,
             history: None,
             config: &config,

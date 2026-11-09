@@ -37,6 +37,7 @@ use crate::widget::link::{PlotLinkGroup, LinkBinding};
 pub use actions::PlotAction;
 pub use keybindings::{KeyBindings, StandardAction};
 pub use tools::{Tool, ToolRegistry, ToolState};
+pub use crate::snap::SnapEngine;
 
 /// A message produced by the plot widget.
 #[derive(Debug, Clone, PartialEq)]
@@ -62,6 +63,37 @@ pub struct Program {
     config: PlotViewConfig,
     cache: Cache,
     link_binding: Option<LinkBinding>, // HIER ERGÄNZEN: Das Binding für die Synchronisation
+    /// Active editing tool state (shared with the app via accessor).
+    pub(crate) tool_state: RefCell<ToolState>,
+    /// Snap engine used by pen/split tools and rendering of snap guides.
+    pub(crate) snap: RefCell<SnapEngine>,
+    /// Optional callback invoked when a tool wants to mutate domain data
+    /// (insert point, split region, ...). The app decides what to do.
+    pub(crate) tool_event: RefCell<Option<ToolEventCallback>>,
+    /// Undo/redo history for widget-level edits (pins, viewport, points).
+    pub(crate) history: RefCell<crate::widget::actions::ActionDispatcher>,
+    /// Clipboard shared by copy/paste actions.
+    pub(crate) clipboard: RefCell<crate::widget::actions::Clipboard>,
+}
+
+/// Callback signature for tool-originated domain mutations.
+pub type ToolEventCallback = std::rc::Rc<dyn Fn(ToolEvent) -> bool>;
+
+/// Events emitted by tools to the host application.
+#[derive(Debug, Clone)]
+pub enum ToolEvent {
+    /// Insert a data point at the given data-space coordinates.
+    InsertPoint { series: crate::series::SeriesId, point: crate::geom::Point },
+    /// Delete the point nearest to the given coordinates.
+    DeletePoint { series: crate::series::SeriesId, index: usize },
+    /// Delete the region under the cursor.
+    DeleteRegion { region: crate::region::RegionId },
+    /// Split the region under the cursor at the given time.
+    SplitRegion { region: crate::region::RegionId, time: f64 },
+    /// Move selection by a data-space delta.
+    MoveSelection { dx: f64, dy: f64 },
+    /// Log an informational message (for status display).
+    Notify(String),
 }
 
 impl Program {
@@ -72,7 +104,134 @@ impl Program {
             config: PlotViewConfig::default(),
             cache: Cache::new(),
             link_binding: None, // Initial leer
+            tool_state: RefCell::new(ToolState::new()),
+            snap: RefCell::new(SnapEngine::new(crate::snap::SnapConfig::default())),
+            tool_event: RefCell::new(None),
+            history: RefCell::new(crate::widget::actions::ActionDispatcher::new()),
+            clipboard: RefCell::new(crate::widget::actions::Clipboard::default()),
         }
+    }
+
+    /// Access the tool state (current tool, active gesture).
+    pub fn tool_state(&self) -> std::cell::Ref<'_, ToolState> {
+        self.tool_state.borrow()
+    }
+
+    /// Mutably access the tool state.
+    pub fn with_tool_state<R>(&self, f: impl FnOnce(&mut ToolState) -> R) -> R {
+        f(&mut self.tool_state.borrow_mut())
+    }
+
+    /// Set the active tool.
+    pub fn set_tool(&self, tool: Tool) {
+        self.with_tool_state(|ts| ts.set_tool(tool));
+        self.request_redraw();
+    }
+
+    /// The active tool.
+    pub fn current_tool(&self) -> Tool {
+        self.tool_state.borrow().current_tool()
+    }
+
+    /// Replace the snap engine (e.g. to sync app config into the widget).
+    pub fn set_snap_engine(&self, engine: SnapEngine) {
+        *self.snap.borrow_mut() = engine;
+        self.request_redraw();
+    }
+
+    /// Read access to the snap engine.
+    pub fn snap(&self) -> std::cell::Ref<'_, SnapEngine> {
+        self.snap.borrow()
+    }
+
+    /// Mutably access the snap engine.
+    pub fn with_snap<R>(&self, f: impl FnOnce(&mut SnapEngine) -> R) -> R {
+        f(&mut self.snap.borrow_mut())
+    }
+
+    /// Register the callback invoked when tools emit domain mutations.
+    pub fn set_tool_event_handler(&self, handler: ToolEventCallback) {
+        *self.tool_event.borrow_mut() = Some(handler);
+    }
+
+    /// Emit a tool event to the host app. Returns whether it was handled.
+    pub(crate) fn emit_tool_event(&self, event: ToolEvent) -> bool {
+        if let Some(handler) = self.tool_event.borrow().as_ref() {
+            handler(event)
+        } else {
+            false
+        }
+    }
+
+    /// Enable/disable snapping (convenience for demos).
+    pub fn set_snap_enabled(&self, enabled: bool) {
+        self.with_snap(|snap| snap.config_mut().enabled = enabled);
+        self.request_redraw();
+    }
+
+    /// Undo the last widget-level edit. Returns true when something was undone.
+    pub fn undo(&self) -> bool {
+        let mut ctx = crate::widget::actions::ActionContext {
+            plot: &mut self.plot.borrow_mut(),
+            state: None,
+            clipboard: &mut self.clipboard.borrow_mut(),
+            history: None,
+            config: &self.config,
+        };
+        let undone = self.history.borrow_mut().undo(&mut ctx).is_some();
+        if undone {
+            self.request_redraw();
+        }
+        undone
+    }
+
+    /// Redo the last undone edit. Returns true when something was redone.
+    pub fn redo(&self) -> bool {
+        let mut ctx = crate::widget::actions::ActionContext {
+            plot: &mut self.plot.borrow_mut(),
+            state: None,
+            clipboard: &mut self.clipboard.borrow_mut(),
+            history: None,
+            config: &self.config,
+        };
+        let redone = self.history.borrow_mut().redo(&mut ctx).is_some();
+        if redone {
+            self.request_redraw();
+        }
+        redone
+    }
+
+    /// Whether an undo is available.
+    pub fn can_undo(&self) -> bool {
+        self.history.borrow().can_undo()
+    }
+
+    /// Whether a redo is available.
+    pub fn can_redo(&self) -> bool {
+        self.history.borrow().can_redo()
+    }
+    
+    /// Number of undoable entries.
+    pub fn history(&self) -> std::cell::Ref<'_, [crate::widget::actions::HistoryGroup]> {
+        std::cell::Ref::map(self.history.borrow(), |h| h.history())
+    }
+    
+    /// Number of redoable entries.
+    pub fn redo_len(&self) -> usize {
+        self.history.borrow().redo_stack().len()
+    }
+
+    /// Execute a plot action through the widget history (undoable).
+    pub fn execute_action(&self, action: std::sync::Arc<dyn crate::widget::actions::PlotAction>) {
+        let mut ctx = crate::widget::actions::ActionContext {
+            plot: &mut self.plot.borrow_mut(),
+            state: None,
+            clipboard: &mut self.clipboard.borrow_mut(),
+            history: None,
+            config: &self.config,
+        };
+        self.history.borrow_mut().execute_dyn(action, &mut ctx);
+        self.request_redraw();
     }
     
     /// Getter für das Link-Binding (wird in events.rs gebraucht)
@@ -207,7 +366,17 @@ impl canvas::Program<Message> for Program {
         // Das lassen wir so, damit der Cursor sich nur ändert, wenn die Maus 
         // wirklich über dem jeweiligen Widget schwebt.
         if cursor.is_over(bounds) {
-            mouse::Interaction::Crosshair
+            match self.current_tool() {
+                Tool::Select => mouse::Interaction::default(),
+                Tool::Pen | Tool::Draw | Tool::Line | Tool::Curve => {
+                    mouse::Interaction::Crosshair
+                }
+                Tool::Eraser => mouse::Interaction::NotAllowed,
+                Tool::Move => mouse::Interaction::Move,
+                Tool::Split => mouse::Interaction::Crosshair,
+                Tool::Scale | Tool::Stretch | Tool::Join | Tool::Velocity
+                | Tool::Quantize => mouse::Interaction::Crosshair,
+            }
         } else {
             mouse::Interaction::default()
         }

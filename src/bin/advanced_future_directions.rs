@@ -17,7 +17,7 @@
 use iced::Widget;
 use iced_liveplot::{
     Plot, PlotBuilder, Series, SeriesKind, Theme, Viewport,
-    widget::{Program, Message as PlotMessage, PlotViewConfig, KeyBindings, StandardAction, keybindings::Chord, Tool, ToolRegistry, ToolState},
+    widget::{Program, Message as PlotMessage, PlotViewConfig, KeyBindings, StandardAction, keybindings::Chord, Tool, ToolRegistry, ToolState, ToolEvent},
     geom::Point,
     render::{LineStyle, MarkerStyle, MarkerShape},
     axis::{AxisConfig, AxisFormatter},
@@ -92,6 +92,26 @@ enum Message {
     KeyPressed(Key, Modifiers),
 }
 
+/// Which series each domain lane is linked to.
+#[derive(Debug, Clone, Copy, Default)]
+struct LinkedSeries {
+    midi: Option<iced_liveplot::series::SeriesId>,
+    audio: Option<iced_liveplot::series::SeriesId>,
+    automation: Option<iced_liveplot::series::SeriesId>,
+    markers: Option<iced_liveplot::series::SeriesId>,
+    signal: Option<iced_liveplot::series::SeriesId>,
+}
+
+/// A tool interaction worth logging.
+#[derive(Debug, Clone)]
+enum ToolLog {
+    Point(f64, f64),
+    RegionDeleted(u64),
+    RegionSplit(u64, f64),
+    Moved(f64, f64),
+    Message(String),
+}
+
 struct AdvancedApp {
     // Core
     program: Program,
@@ -107,6 +127,11 @@ struct AdvancedApp {
     automation_lane: AutomationLane,
     markers: Vec<DataRegion>,
     loop_region: Option<DataRegion>,
+    
+    // Series ids that regions are linked to (legend toggling)
+    linked_series: LinkedSeries,
+    // Tool events collected from the widget (drained in update)
+    pending_tool_events: std::rc::Rc<std::cell::RefCell<Vec<ToolLog>>>,
     
     // State
     streaming: bool,
@@ -244,6 +269,8 @@ impl AdvancedApp {
             automation_lane,
             markers,
             loop_region,
+            linked_series: LinkedSeries::default(),
+            pending_tool_events: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
             streaming: false,
             last_stream: Instant::now(),
             stream_phase: 0.0,
@@ -254,8 +281,59 @@ impl AdvancedApp {
             snap_enabled: true,
         };
         
+        // Track which series regions are linked to (for legend toggling)
+        let (midi_sid, audio_sid, auto_sid, marker_sid, signal_sid) = {
+            let plot = app.program.plot();
+            let find = |name: &str| plot.series().iter().find(|s| s.name() == name).map(|s| s.id());
+            (
+                find("MIDI Notes"),
+                find("Audio Regions"),
+                find("Automation"),
+                find("Markers"),
+                find("signal"),
+            )
+        };
+        app.linked_series = LinkedSeries { midi: midi_sid, audio: audio_sid, automation: auto_sid, markers: marker_sid, signal: signal_sid };
+
+        // Wire the tool event handler: tools emit domain mutations; we log
+        // them into a shared buffer that `update` drains into real mutations.
+        let pending = app.pending_tool_events.clone();
+        app.program.set_tool_event_handler(std::rc::Rc::new(move |event| {
+            let mut buf = pending.borrow_mut();
+            match event {
+                ToolEvent::InsertPoint { series: _, point } => {
+                    buf.push(ToolLog::Point(point.x, point.y));
+                    true
+                }
+                ToolEvent::DeleteRegion { region } => {
+                    buf.push(ToolLog::RegionDeleted(region.0));
+                    true
+                }
+                ToolEvent::SplitRegion { region, time } => {
+                    buf.push(ToolLog::RegionSplit(region.0, time));
+                    true
+                }
+                ToolEvent::MoveSelection { dx, dy } => {
+                    buf.push(ToolLog::Moved(dx, dy));
+                    true
+                }
+                ToolEvent::DeletePoint { series: _, index: _ } => {
+                    buf.push(ToolLog::Message("Erase: no point under cursor".into()));
+                    true
+                }
+                ToolEvent::Notify(msg) => {
+                    buf.push(ToolLog::Message(msg));
+                    true
+                }
+            }
+        }));
+
         // Populate demo data
         app.populate_demo_data();
+        
+        // Link each region to its domain series so legend toggles hide
+        // both the series and its regions.
+        app.link_regions_to_series();
         
         (app, Task::none())
     }
@@ -434,13 +512,14 @@ impl AdvancedApp {
             track.add_note(note);
         }
         
-        let region = DataRegion::midi_note(
+        let mut region = DataRegion::midi_note(
             pitch,
             velocity,
             1,
             snapped_time,
             snapped_time + duration,
         );
+        region.series = self.linked_series.midi;
         
         self.program.with_plot_mut(|plot| plot.add_region(region));
         self.log_action(format!("Added MIDI note: {} (pitch={}, vel={}, time={:.2}s)", 
@@ -458,7 +537,8 @@ impl AdvancedApp {
         region.fade_out = 0.05;
         self.audio_regions.push(region.clone());
         
-        let data_region = region.to_data_region();
+        let mut data_region = region.to_data_region();
+        data_region.series = self.linked_series.audio;
         
         self.program.with_plot_mut(|plot| plot.add_region(data_region));
         self.log_action(format!("Added audio region: Clip {} at {:.1}s ({:.1}s)", 
@@ -468,12 +548,13 @@ impl AdvancedApp {
     fn add_automation_point(&mut self, parameter: String, time: f64, value: f64, curve: CurveType) {
         self.automation_lane.insert_point(AutomationPoint::with_curve(time, value.clamp(0.0, 1.0), curve));
         
-        let region = DataRegion::automation_point(
+        let mut region = DataRegion::automation_point(
             parameter.clone(),
             value.clamp(0.0, 1.0),
             time,
             curve,
         );
+        region.series = self.linked_series.automation;
         
         self.program.with_plot_mut(|plot| plot.add_region(region));
         self.log_action(format!("Added automation point: {}={:.2} at {:.1}s ({:?})", 
@@ -481,11 +562,12 @@ impl AdvancedApp {
     }
     
     fn add_marker(&mut self, label: String, time: f64) {
-        let marker = DataRegion::marker(
+        let mut marker = DataRegion::marker(
             label.clone(),
             time,
             AudioSerializableColor::new(1.0, 0.8, 0.0, 1.0),
         );
+        marker.series = self.linked_series.markers;
         
         self.markers.push(marker.clone());
         self.program.with_plot_mut(|plot| plot.add_region(marker));
@@ -547,15 +629,81 @@ impl AdvancedApp {
     }
     
     // ========================================================================
+    // Region/series linking (legend integration)
+    // ========================================================================
+    
+    /// Assign each plot region to its domain series (by kind + timing).
+    fn link_regions_to_series(&mut self) {
+        let linked = self.linked_series;
+        self.program.with_plot_mut(|plot| {
+            for region in plot.regions_mut() {
+                match &region.kind {
+                    RegionKind::MidiNote { .. } => region.series = linked.midi,
+                    RegionKind::AudioRegion { .. } => region.series = linked.audio,
+                    RegionKind::AutomationPoint { .. } => region.series = linked.automation,
+                    RegionKind::Marker { .. } => region.series = linked.markers,
+                    _ => {}
+                }
+            }
+        });
+    }
+    
+    // ========================================================================
+    // Tool event processing
+    // ========================================================================
+    
+    fn drain_tool_events(&mut self) {
+        let events: Vec<ToolLog> = std::mem::take(&mut *self.pending_tool_events.borrow_mut());
+        for event in events {
+            match event {
+                ToolLog::Point(x, y) => {
+                    // Pen tool inserted a point: add an automation region at (x, y)
+                    // (automation is the natural "insert a point" lane in this demo)
+                    let v = y.clamp(0.0, 1.0);
+                    let curve = if v > 0.7 { CurveType::Exponential }
+                                else if v < 0.3 { CurveType::SCurve }
+                                else { CurveType::Linear };
+                    self.add_automation_point("filter_cutoff".to_string(), x, v, curve);
+                }
+                ToolLog::RegionDeleted(id) => {
+                    self.program.with_plot_mut(|plot| plot.remove_region(RegionId(id)));
+                    self.markers.retain(|m| m.id.0 != id);
+                    if self.loop_region.as_ref().map(|r| r.id.0) == Some(id) {
+                        self.loop_region = None;
+                    }
+                    self.log_action(format!("Eraser: removed region #{}", id));
+                }
+                ToolLog::RegionSplit(id, time) => {
+                    self.log_action(format!("Split region #{} at {:.2}s (mirrored: original kept)", id, time));
+                }
+                ToolLog::Moved(dx, dy) => {
+                    self.log_action(format!("Moved selection by ({:.2}, {:.2})", dx, dy));
+                }
+                ToolLog::Message(msg) => {
+                    self.log_action(msg);
+                }
+            }
+        }
+    }
+    
+    // ========================================================================
     // Undo/Redo
     // ========================================================================
     
     fn undo(&mut self) {
-        self.log_action("Undo requested (handled by plot widget)".to_string());
+        if self.program.undo() {
+            self.log_action("Undo".to_string());
+        } else {
+            self.log_action("Undo: nothing to undo".to_string());
+        }
     }
     
     fn redo(&mut self) {
-        self.log_action("Redo requested (handled by plot widget)".to_string());
+        if self.program.redo() {
+            self.log_action("Redo".to_string());
+        } else {
+            self.log_action("Redo: nothing to redo".to_string());
+        }
     }
     
     // ========================================================================
@@ -563,6 +711,8 @@ impl AdvancedApp {
     // ========================================================================
     
     fn update(&mut self, message: Message) -> Task<Message> {
+        // Drain tool events emitted by the widget since last update
+        self.drain_tool_events();
         match message {
             Message::Plot(plot_msg) => {
                 match plot_msg {
@@ -600,17 +750,23 @@ impl AdvancedApp {
             Message::ToggleSnap => {
                 self.snap_enabled = !self.snap_enabled;
                 self.snap_engine.config_mut().enabled = self.snap_enabled;
+                // Keep the widget's snap engine in sync (pen tool snapping)
+                let engine = self.snap_engine.clone();
+                self.program.set_snap_engine(engine);
                 self.log_action(format!("Snap: {}", if self.snap_enabled { "ON" } else { "OFF" }));
             }
             Message::SetSnapDivision(division) => {
                 if let Some(grid) = self.snap_engine.config_mut().grid.as_mut() {
                     grid.division = division;
                 }
+                let engine = self.snap_engine.clone();
+                self.program.set_snap_engine(engine);
                 self.log_action(format!("Snap division: 1/{}", division));
             }
             Message::SetTool(tool) => {
                 self.tool_state.set_tool(tool);
-                self.log_action(format!("Tool: {}", tool.name()));
+                self.program.set_tool(tool);
+                self.log_action(format!("Tool: {} (cursor updated)", tool.name()));
             }
             Message::Undo => {
                 self.undo();
@@ -653,8 +809,28 @@ impl AdvancedApp {
             }
             Message::KeyPressed(key, modifiers) => {
                 if let Some(action) = self.keybindings.lookup(key.clone(), modifiers) {
-                    self.log_action(format!("Keybinding: {:?} -> {:?}", (key, modifiers), action));
-                    // In real app, execute action via dispatcher
+                    use iced_liveplot::widget::StandardAction;
+                    match action {
+                        StandardAction::Undo => self.undo(),
+                        StandardAction::Redo => self.redo(),
+                        StandardAction::ToggleSnap => {
+                            self.snap_enabled = !self.snap_enabled;
+                            self.program.set_snap_enabled(self.snap_enabled);
+                            self.log_action(format!("Snap: {}", if self.snap_enabled { "ON" } else { "OFF" }));
+                        }
+                        StandardAction::SelectAll => self.select_all_regions(),
+                        StandardAction::DeselectAll => self.clear_selection(),
+                        StandardAction::Delete => self.delete_selected_regions(),
+                        StandardAction::ToolSelect => self.program.set_tool(Tool::Select),
+                        StandardAction::ToolPen => self.program.set_tool(Tool::Pen),
+                        StandardAction::ToolEraser => self.program.set_tool(Tool::Eraser),
+                        StandardAction::ToolMove => self.program.set_tool(Tool::Move),
+                        StandardAction::ToolScale => self.program.set_tool(Tool::Scale),
+                        StandardAction::ToolStretch => self.program.set_tool(Tool::Stretch),
+                        _ => {
+                            self.log_action(format!("Key: {:?}", action));
+                        }
+                    }
                 }
             }
         }
@@ -852,10 +1028,10 @@ impl AdvancedApp {
     }
     
     fn build_info_panel(&self) -> impl iced::Widget<Message> + use<'_> {
-        let can_undo = false;
-        let can_redo = false;
-        let history_len = 0;
-        let redo_len = 0;
+        let can_undo = self.program.can_undo();
+        let can_redo = self.program.can_redo();
+        let history_len = self.program.history().len();
+        let redo_len = self.program.redo_len();
         
         container(
             column![

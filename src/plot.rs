@@ -144,7 +144,11 @@ impl Plot {
         self.regions.len() != len
     }
 
-    /// Compute bounds across all visible series.
+    /// Compute bounds across all visible series AND visible regions.
+    ///
+    /// Regions contribute their bounds so the plot can auto-fit even when
+    /// no series is visible (e.g. MIDI/audio/automation region workflows).
+    /// Falls back to the cached viewport when there is no data at all.
     pub fn data_bounds(&self) -> Option<Viewport> {
         let mut x_range: Option<Range> = None;
         let mut y_range: Option<Range> = None;
@@ -163,9 +167,37 @@ impl Plot {
                 });
             }
         }
+        // Include region bounds so region-only plots (no visible series)
+        // still auto-fit instead of showing a degenerate 0..1 viewport.
+        for region in &self.regions {
+            if !region.visible {
+                continue;
+            }
+            if let Some(xr) = region.time_range() {
+                let xr = crate::view::Range::new(xr.min, xr.max);
+                x_range = Some(match x_range {
+                    None => xr,
+                    Some(existing) => Range::union(existing, xr)?,
+                });
+            }
+            if let Some(yr) = region.value_range() {
+                let yr = crate::view::Range::new(yr.min, yr.max);
+                y_range = Some(match y_range {
+                    None => yr,
+                    Some(existing) => Range::union(existing, yr)?,
+                });
+            }
+        }
         match (x_range, y_range) {
-            (Some(x), Some(y)) => Some(Viewport::new(x, y)),
-            _ => None,
+            (Some(x), Some(y)) => {
+                // Guard against degenerate (zero-span or non-finite) bounds
+                let x = x.with_min_span(1e-9);
+                let y = y.with_min_span(1e-9);
+                Some(Viewport::new(x, y))
+            }
+            (None, None) => self.viewport, // keep last known good view
+            (Some(x), None) => Some(Viewport::new(x.with_min_span(1e-9), Range::new(-1.0, 1.0))),
+            (None, Some(y)) => Some(Viewport::new(Range::new(0.0, 1.0), y.with_min_span(1e-9))),
         }
     }
 

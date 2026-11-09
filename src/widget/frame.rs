@@ -630,11 +630,26 @@ fn build_regions(
         };
         
         // Clip to plot rect
-        let min_x = screen_bounds.min.x.max(plot_rect.min.x);
+        let mut min_x = screen_bounds.min.x.max(plot_rect.min.x);
+        let mut max_x = screen_bounds.max.x.min(plot_rect.max.x);
         let min_y = screen_bounds.min.y.max(plot_rect.min.y);
-        let max_x = screen_bounds.max.x.min(plot_rect.max.x);
         let max_y = screen_bounds.max.y.min(plot_rect.max.y);
         
+        // Point-like regions (markers, automation points) collapse to zero
+        // width; give them a minimal 2px on-screen footprint so they stay
+        // visible and hittable.
+        let is_point_like = matches!(
+            region.kind,
+            crate::region::RegionKind::Marker { .. } | crate::region::RegionKind::AutomationPoint { .. }
+        );
+        if min_x >= max_x {
+            if !is_point_like {
+                continue;
+            }
+            let clamped = ((min_x + max_x) * 0.5).max(plot_rect.min.x).min(plot_rect.max.x);
+            min_x = (clamped - 1.0).max(plot_rect.min.x);
+            max_x = (clamped + 1.0).min(plot_rect.max.x);
+        }
         if min_x >= max_x || min_y >= max_y {
             continue;
         }
@@ -643,23 +658,40 @@ fn build_regions(
             ScreenPoint::new(min_x, min_y),
             ScreenPoint::new(max_x, max_y),
         );
-        
-        
-        // Get region style
-        let fill_color = region.style.fill.unwrap_or(match &region.kind {
-            crate::region::RegionKind::MidiNote { .. } => SerializableColor::new(0.4, 0.6, 1.0, 0.7),
-            crate::region::RegionKind::AudioRegion { .. } => SerializableColor::new(0.6, 0.8, 0.4, 0.6),
-            crate::region::RegionKind::AutomationPoint { .. } => SerializableColor::new(1.0, 0.6, 0.2, 0.9),
-            crate::region::RegionKind::Marker { color, .. } => *color,
-            crate::region::RegionKind::Loop { .. } => SerializableColor::new(1.0, 0.8, 0.0, 0.3),
-            _ => return, // skip if no fill
-        }).to_iced();
-        
-        let stroke_color = region.style.stroke.unwrap_or_else(|| SerializableColor::from_iced(theme.selection_border)).to_iced();
-        let stroke_width = region.style.stroke_width;
-        
-        // Draw region based on kind
-        match &region.kind {
+        draw_region_body(render, region, clipped_bounds, plot_rect, theme);
+    }
+    
+    render.push(RenderCommand::ClipEnd);
+}
+#[allow(clippy::too_many_arguments)]
+fn draw_region_body(
+    render: &mut RenderList,
+    region: &crate::region::DataRegion,
+    clipped_bounds: ScreenRect,
+    plot_rect: ScreenRect,
+    theme: &crate::style::Theme,
+) {
+    let plot_top = plot_rect.min.y;
+    let plot_bottom = plot_rect.max.y;
+    let plot_right = plot_rect.max.x;
+    let plot_left = plot_rect.min.x;
+    let _ = plot_left;
+    
+    // Get region style
+    let fill_color = region.style.fill.unwrap_or(match &region.kind {
+        crate::region::RegionKind::MidiNote { .. } => SerializableColor::new(0.4, 0.6, 1.0, 0.7),
+        crate::region::RegionKind::AudioRegion { .. } => SerializableColor::new(0.6, 0.8, 0.4, 0.6),
+        crate::region::RegionKind::AutomationPoint { .. } => SerializableColor::new(1.0, 0.6, 0.2, 0.9),
+        crate::region::RegionKind::Marker { color, .. } => *color,
+        crate::region::RegionKind::Loop { .. } => SerializableColor::new(1.0, 0.8, 0.0, 0.3),
+        _ => SerializableColor::new(0.5, 0.5, 0.5, 0.5),
+    }).to_iced();
+    
+    let stroke_color = region.style.stroke.unwrap_or_else(|| SerializableColor::from_iced(theme.selection_border)).to_iced();
+    let stroke_width = region.style.stroke_width;
+    
+    // Draw region based on kind
+    match &region.kind {
             crate::region::RegionKind::MidiNote { pitch, velocity, channel, .. } => {
                 // MIDI note as rectangle
                 render.push(RenderCommand::Rect {
@@ -787,17 +819,34 @@ fn build_regions(
                 });
             }
             crate::region::RegionKind::Marker { label, color, .. } => {
-                // Marker as triangle flag
-                let flag_width = 80.0;
-                let flag_height = 20.0;
-                
+                // Marker: vertical line through the whole plot height + flag
+                let line_x = (clipped_bounds.min.x + clipped_bounds.max.x) * 0.5;
+                let marker_color = color.to_iced();
+                let flag_width = 80.0_f32.min(plot_right - line_x).max(12.0);
+                let flag_height = 18.0;
+                let _ = label;
+
+                // Vertical line (use the clipped strip extended to plot height)
+                let line_rect = ScreenRect::new(
+                    ScreenPoint::new(line_x - 1.0, plot_top),
+                    ScreenPoint::new(line_x + 1.0, plot_bottom),
+                );
+                render.push(RenderCommand::Rect {
+                    rect: line_rect,
+                    style: RectStyle {
+                        fill: marker_color,
+                        stroke: Color::TRANSPARENT,
+                        stroke_width: 0.0,
+                    },
+                });
+
+                // Triangle flag at the top
                 let mut builder = iced::widget::canvas::path::Builder::new();
-                builder.move_to(iced::Point::new(clipped_bounds.min.x, clipped_bounds.max.y));
-                builder.line_to(iced::Point::new(clipped_bounds.min.x + flag_width, clipped_bounds.max.y - flag_height / 2.0));
-                builder.line_to(iced::Point::new(clipped_bounds.min.x, clipped_bounds.min.y));
+                builder.move_to(iced::Point::new(line_x, plot_top + flag_height));
+                builder.line_to(iced::Point::new(line_x + flag_width, plot_top + flag_height / 2.0));
+                builder.line_to(iced::Point::new(line_x, plot_top));
                 builder.close();
                 let flag = builder.build();
-                let marker_color = color.to_iced();
                 render.push(RenderCommand::Path {
                     path: flag,
                     fill: Some(marker_color),
@@ -806,15 +855,8 @@ fn build_regions(
                 });
                 // Draw label
                 if let Some(label_text) = &region.style.label {
-                    let text = iced::widget::canvas::Text {
-                        content: label_text.clone(),
-                        position: IcedPoint::new(clipped_bounds.min.x + 4.0, clipped_bounds.min.y + 2.0),
-                        color: region.style.label_color.unwrap_or(SerializableColor::WHITE).to_iced(),
-                        size: iced::Pixels(10.0),
-                        ..Default::default()
-                    };
                     render.push(RenderCommand::Text {
-                        position: ScreenPoint::new(clipped_bounds.min.x + 4.0, clipped_bounds.min.y + 2.0),
+                        position: ScreenPoint::new(line_x + 6.0, plot_top + 3.0),
                         text: label_text.clone(),
                         style: TextStyle {
                             color: region.style.label_color.unwrap_or(SerializableColor::WHITE).to_iced(),
@@ -873,7 +915,6 @@ fn build_regions(
                 });
             }
         }
-        
         // Draw selection highlight
         if region.selected {
             let highlight_bounds = ScreenRect::new(
@@ -951,7 +992,6 @@ fn build_regions(
                 },
             });
         }
-    }
     
     render.push(RenderCommand::ClipEnd);
 }
