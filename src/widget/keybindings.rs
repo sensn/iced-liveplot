@@ -43,12 +43,14 @@ pub enum StandardAction {
     PrevSeries,
     
     // Tools
+    ToolGrab,
     ToolSelect,
     ToolPen,
     ToolEraser,
     ToolMove,
     ToolScale,
     ToolStretch,
+    ToolSplit,
     
     // Snap/Grid
     ToggleSnap,

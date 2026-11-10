@@ -15,6 +15,10 @@ use std::collections::HashMap;
 /// Available editing tools
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Tool {
+    /// Grab tool (DEFAULT) — navigation mode: left-drag on empty plot pans,
+    /// left-click on data inserts a pin, double-click resets the view,
+    /// right-drag box-zooms. Matches the classic plot navigation behavior.
+    Grab,
     /// Select tool - click to select, drag to box-select
     Select,
     /// Pen tool - click to add points/regions
@@ -47,6 +51,7 @@ impl Tool {
     /// Get all available tools
     pub fn all() -> &'static [Tool] {
         &[
+            Tool::Grab,
             Tool::Select,
             Tool::Pen,
             Tool::Eraser,
@@ -66,6 +71,7 @@ impl Tool {
     /// Get tool name for UI
     pub fn name(&self) -> &'static str {
         match self {
+            Tool::Grab => "Grab",
             Tool::Select => "Select",
             Tool::Pen => "Pen",
             Tool::Eraser => "Eraser",
@@ -85,6 +91,7 @@ impl Tool {
     /// Get tool description
     pub fn description(&self) -> &'static str {
         match self {
+            Tool::Grab => "Pan (drag), pin (click data), zoom box (right-drag), double-click reset",
             Tool::Select => "Click to select, drag to box-select",
             Tool::Pen => "Click to add points/regions",
             Tool::Eraser => "Click to delete points/regions",
@@ -104,6 +111,7 @@ impl Tool {
     /// Get default cursor for tool
     pub fn cursor(&self) -> iced::mouse::Interaction {
         match self {
+            Tool::Grab => iced::mouse::Interaction::Grabbing,
             Tool::Select => iced::mouse::Interaction::Crosshair,
             Tool::Pen => iced::mouse::Interaction::Crosshair,
             Tool::Eraser => iced::mouse::Interaction::Crosshair,
@@ -174,7 +182,7 @@ pub struct ToolState {
 impl Default for ToolState {
     fn default() -> Self {
         Self {
-            current_tool: Tool::Select,
+            current_tool: Tool::Grab,
             gesture: ToolGesture::None,
             last_cursor: None,
             move_gesture: None,

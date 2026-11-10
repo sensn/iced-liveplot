@@ -586,6 +586,7 @@ impl canvas::Program<Message> for Program {
         // wirklich über dem jeweiligen Widget schwebt.
         if cursor.is_over(bounds) {
             match self.current_tool() {
+                Tool::Grab => mouse::Interaction::Grabbing,
                 Tool::Select => mouse::Interaction::default(),
                 Tool::Pen | Tool::Draw | Tool::Line | Tool::Curve => {
                     mouse::Interaction::Crosshair

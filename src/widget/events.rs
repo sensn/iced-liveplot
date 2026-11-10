@@ -191,14 +191,18 @@ fn handle_mouse_down(
     let region = state.regions.hit_test(pos);
 
     // ---- TOOLS: active tool hijacks left-drag inside the plot area ----
+    // Grab is the default navigation tool and keeps the ORIGINAL behavior:
+    // left-drag pans, click-on-data pins, right-drag box zooms (below).
     if button == mouse::Button::Left && region == HitRegion::Plot {
         let tool = program.current_tool();
-        run_tool_mouse(program, state, tool, pos, ToolPhase::Down);
-        if tool != Tool::Select {
-            return;
+        if tool != Tool::Grab {
+            run_tool_mouse(program, state, tool, pos, ToolPhase::Down);
+            if tool != Tool::Select {
+                return;
+            }
+            // Select tool: run_tool_mouse started a BoxSelect drag; fall through
+            // so pending_click logic still applies on release.
         }
-        // Select tool: run_tool_mouse started a BoxSelect drag; fall through
-        // so pending_click logic still applies on release.
     }
 
     let (mode, active) = match (button, region) {
@@ -330,7 +334,7 @@ fn handle_mouse_move(
     // ---- TOOLS: feed move to active tool while dragging ----
     let tool_dragging = state.drag.as_ref().is_some_and(|d| d.active);
     let tool = program.current_tool();
-    if tool_dragging && hit_region == HitRegion::Plot {
+    if tool_dragging && hit_region == HitRegion::Plot && tool != Tool::Grab {
         run_tool_mouse(program, state, tool, pos, ToolPhase::Move);
         if matches!(tool, Tool::Draw | Tool::Select | Tool::Move | Tool::Scale | Tool::Stretch) {
             // These tools consume the move; no pan
@@ -423,8 +427,10 @@ fn handle_mouse_up(
     let _click = state.pending_click.take();
 
     // ---- TOOLS: finish tool gesture (before zoom-rect / double-click logic) ----
+    // Grab keeps the original flow: box-zoom commit, double-click ResetView,
+    // pin toggle — all handled below.
     let tool = program.current_tool();
-    if button == mouse::Button::Left {
+    if tool != Tool::Grab && button == mouse::Button::Left {
         if let Some(pos) = position {
             let was_box = state.drag.as_ref().is_some_and(|d| d.mode == DragMode::BoxSelect && d.active);
             run_tool_mouse(program, state, tool, pos, ToolPhase::Up);

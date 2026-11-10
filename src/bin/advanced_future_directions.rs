@@ -425,7 +425,8 @@ impl AdvancedApp {
         keybindings.bind(ch("g"), Modifiers::CTRL, StandardAction::ToggleGrid);
         keybindings.bind(ch("g"), Modifiers::CTRL | Modifiers::SHIFT, StandardAction::ToggleMinorGrid);
         
-        // Tools
+        // Tools (Grab is default: key G)
+        keybindings.bind(ch("g"), Modifiers::empty(), StandardAction::ToolGrab);
         keybindings.bind(ch("1"), Modifiers::empty(), StandardAction::ToolSelect);
         keybindings.bind(ch("2"), Modifiers::empty(), StandardAction::ToolPen);
         keybindings.bind(ch("3"), Modifiers::empty(), StandardAction::ToolEraser);
@@ -1063,6 +1064,7 @@ impl AdvancedApp {
                         StandardAction::SelectAll => self.select_all_regions(),
                         StandardAction::DeselectAll => self.clear_selection(),
                         StandardAction::Delete => self.delete_selected_regions(),
+                        StandardAction::ToolGrab => self.program.set_tool(Tool::Grab),
                         StandardAction::ToolSelect => self.program.set_tool(Tool::Select),
                         StandardAction::ToolPen => self.program.set_tool(Tool::Pen),
                         StandardAction::ToolEraser => self.program.set_tool(Tool::Eraser),
@@ -1183,15 +1185,17 @@ impl AdvancedApp {
                 
                 rule::horizontal(2),
                 
-                // Tools
-                text("Tools (1-9)").size(18),
+                // Tools — Grab is the DEFAULT navigation tool
+                text("Tools (1-9, Grab = default)").size(18),
                 self.control_row("", vec![
+                    (if self.program.current_tool() == Tool::Grab { "[Grab]" } else { "Grab" }, Message::SetTool(Tool::Grab)),
                     ("Select", Message::SetTool(Tool::Select)),
                     ("Pen", Message::SetTool(Tool::Pen)),
                     ("Eraser", Message::SetTool(Tool::Eraser)),
                     ("Move", Message::SetTool(Tool::Move)),
                     ("Scale", Message::SetTool(Tool::Scale)),
                     ("Stretch", Message::SetTool(Tool::Stretch)),
+                    ("Split", Message::SetTool(Tool::Split)),
                     ("Draw", Message::SetTool(Tool::Draw)),
                     ("Line", Message::SetTool(Tool::Line)),
                     ("Curve", Message::SetTool(Tool::Curve)),
