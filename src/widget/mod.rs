@@ -52,6 +52,105 @@ pub enum Message {
     ResetView, // HIER HINZUFÜGEN
 }
 
+/// Editing domain — decides how tools interpret clicks in the plot area.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Domain {
+    /// MIDI piano-roll editing: pen inserts notes, move drags notes,
+    /// Y axis shows note numbers 0-127.
+    #[default]
+    Midi,
+    /// Audio region editing: pen places clip anchors, move drags clips.
+    Audio,
+    /// Automation lane editing: pen inserts points, draw freehand curves.
+    Automation,
+    /// Marker editing: pen drops markers at click position.
+    Markers,
+    /// Loop/punch region editing: pen sets loop start/end.
+    Loop,
+}
+
+impl Domain {
+    pub fn all() -> &'static [Domain] {
+        &[Domain::Midi, Domain::Audio, Domain::Automation, Domain::Markers, Domain::Loop]
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Domain::Midi => "MIDI",
+            Domain::Audio => "Audio",
+            Domain::Automation => "Automation",
+            Domain::Markers => "Markers",
+            Domain::Loop => "Loop",
+        }
+    }
+}
+
+/// Note length selector for the MIDI domain pen tool, in 1/N notes
+/// (16 = sixteenth, 8 = eighth, 4 = quarter, 2 = half, 1 = whole).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoteLength {
+    Sixteenth,
+    Eighth,
+    Quarter,
+    Half,
+    Whole,
+}
+
+impl NoteLength {
+    pub fn all() -> &'static [NoteLength] {
+        &[
+            NoteLength::Sixteenth,
+            NoteLength::Eighth,
+            NoteLength::Quarter,
+            NoteLength::Half,
+            NoteLength::Whole,
+        ]
+    }
+
+    /// Length in seconds at the given BPM.
+    pub fn seconds(&self, bpm: f64) -> f64 {
+        let beat = 60.0 / bpm.max(1.0);
+        match self {
+            NoteLength::Sixteenth => beat / 4.0,
+            NoteLength::Eighth => beat / 2.0,
+            NoteLength::Quarter => beat,
+            NoteLength::Half => beat * 2.0,
+            NoteLength::Whole => beat * 4.0,
+        }
+    }
+
+    /// Length in MIDI ticks at the given ticks-per-beat.
+    pub fn ticks(&self, ticks_per_beat: u32) -> u64 {
+        (ticks_per_beat as u64) * match self {
+            NoteLength::Sixteenth => 1,
+            NoteLength::Eighth => 2,
+            NoteLength::Quarter => 4,
+            NoteLength::Half => 8,
+            NoteLength::Whole => 16,
+        } / 4
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            NoteLength::Sixteenth => "1/16",
+            NoteLength::Eighth => "1/8",
+            NoteLength::Quarter => "1/4",
+            NoteLength::Half => "1/2",
+            NoteLength::Whole => "1/1",
+        }
+    }
+}
+
+/// X axis display mode for time-based plots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TimeAxisMode {
+    /// Show seconds (or the plot's native formatter).
+    #[default]
+    Seconds,
+    /// Show MIDI ticks (requires ticks-per-beat).
+    Ticks,
+}
+
 /// The plot widget program: owns the plot model and renders it on a canvas.
 ///
 /// The plot lives behind a [`RefCell`] because `canvas::Program::draw` and
@@ -74,6 +173,14 @@ pub struct Program {
     pub(crate) history: RefCell<crate::widget::actions::ActionDispatcher>,
     /// Clipboard shared by copy/paste actions.
     pub(crate) clipboard: RefCell<crate::widget::actions::Clipboard>,
+    /// Active editing domain (MIDI / Audio / Automation / Markers / Loop).
+    pub(crate) domain: RefCell<Domain>,
+    /// MIDI pen tool note length.
+    pub(crate) note_length: RefCell<NoteLength>,
+    /// X axis display mode (seconds vs MIDI ticks).
+    pub(crate) time_axis: RefCell<TimeAxisMode>,
+    /// Ticks per beat used when the axis shows ticks.
+    pub(crate) ticks_per_beat: std::cell::Cell<u32>,
 }
 
 /// Callback signature for tool-originated domain mutations.
@@ -84,16 +191,42 @@ pub type ToolEventCallback = std::rc::Rc<dyn Fn(ToolEvent) -> bool>;
 pub enum ToolEvent {
     /// Insert a data point at the given data-space coordinates.
     InsertPoint { series: crate::series::SeriesId, point: crate::geom::Point },
+    /// Insert a MIDI note (MIDI domain pen): pitch from click Y,
+    /// start from click X (already snapped), length from NoteLength.
+    InsertMidiNote { pitch: u8, velocity: u8, start: f64, duration: f64 },
+    /// Insert an audio clip anchor (Audio domain pen).
+    InsertAudioClip { start: f64, duration: f64 },
+    /// Insert an automation point (Automation domain pen).
+    InsertAutomationPoint { time: f64, value: f64 },
+    /// Drop a marker (Markers domain pen).
+    InsertMarker { time: f64 },
+    /// Set the loop region (Loop domain pen: first click = start, second = end
+    /// or a drag covering the loop).
+    SetLoopRegion { start: f64, end: f64 },
     /// Delete the point nearest to the given coordinates.
     DeletePoint { series: crate::series::SeriesId, index: usize },
     /// Delete the region under the cursor.
     DeleteRegion { region: crate::region::RegionId },
     /// Split the region under the cursor at the given time.
     SplitRegion { region: crate::region::RegionId, time: f64 },
+    /// Move a region by a time delta (ticks/seconds depending on domain).
+    MoveRegion { region: crate::region::RegionId, dt: f64, dy: u8 },
+    /// Resize a region edge (start or end).
+    ResizeRegion { region: crate::region::RegionId, edge: ResizeEdge, time: f64 },
     /// Move selection by a data-space delta.
     MoveSelection { dx: f64, dy: f64 },
+    /// Rubber-band selection finished: all regions intersecting the
+    /// data-space rect should be selected.
+    BoxSelect { x0: f64, x1: f64, y0: f64, y1: f64 },
     /// Log an informational message (for status display).
     Notify(String),
+}
+
+/// Which edge of a region is being resized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeEdge {
+    Start,
+    End,
 }
 
 impl Program {
@@ -109,6 +242,10 @@ impl Program {
             tool_event: RefCell::new(None),
             history: RefCell::new(crate::widget::actions::ActionDispatcher::new()),
             clipboard: RefCell::new(crate::widget::actions::Clipboard::default()),
+            domain: RefCell::new(Domain::default()),
+            note_length: RefCell::new(NoteLength::Quarter),
+            time_axis: RefCell::new(TimeAxisMode::default()),
+            ticks_per_beat: std::cell::Cell::new(480),
         }
     }
 
@@ -166,6 +303,88 @@ impl Program {
     /// Enable/disable snapping (convenience for demos).
     pub fn set_snap_enabled(&self, enabled: bool) {
         self.with_snap(|snap| snap.config_mut().enabled = enabled);
+        self.request_redraw();
+    }
+
+    /// The active editing domain.
+    pub fn domain(&self) -> Domain {
+        *self.domain.borrow()
+    }
+
+    /// Set the active editing domain. Adjusts the Y axis to the domain
+    /// convention (MIDI: note numbers 0-127; Automation: 0-1 unitless).
+    pub fn set_domain(&self, domain: Domain) {
+        *self.domain.borrow_mut() = domain;
+        // Domain-specific Y axis formatting
+        let midi_fmt = crate::axis::AxisFormatter::Custom(std::sync::Arc::new(|v| {
+            let n = v.round().clamp(0.0, 127.0) as u8;
+            format!("{} ({})", n, crate::midi::midi_note_name(n))
+        }));
+        let auto_fmt = crate::axis::AxisFormatter::Custom(std::sync::Arc::new(|v| {
+            format!("{:.2}", v)
+        }));
+        self.with_plot_mut(|plot| match domain {
+            Domain::Midi => {
+                plot.y_axis_mut().set_formatter(midi_fmt);
+            }
+            Domain::Automation => {
+                plot.y_axis_mut().set_formatter(auto_fmt);
+            }
+            _ => {}
+        });
+        self.apply_time_axis_formatter();
+        self.request_redraw();
+    }
+
+    /// Apply the X axis formatter for the current time-axis mode.
+    fn apply_time_axis_formatter(&self) {
+        let mode = *self.time_axis.borrow();
+        let tpb = self.ticks_per_beat.get();
+        self.with_plot_mut(|plot| match mode {
+            TimeAxisMode::Seconds => {
+                plot.x_axis_mut().set_formatter(
+                    crate::axis::AxisFormatter::Custom(std::sync::Arc::new(|v| format!("{:.1}s", v))),
+                );
+            }
+            TimeAxisMode::Ticks => {
+                plot.x_axis_mut().set_formatter(crate::axis::AxisFormatter::Custom(
+                    std::sync::Arc::new(move |v| format!("{}", (v * tpb as f64 * 2.0).round() as i64)),
+                ));
+            }
+        });
+    }
+
+    /// The MIDI pen note length.
+    pub fn note_length(&self) -> NoteLength {
+        *self.note_length.borrow()
+    }
+
+    /// Set the MIDI pen note length.
+    pub fn set_note_length(&self, len: NoteLength) {
+        *self.note_length.borrow_mut() = len;
+        self.request_redraw();
+    }
+
+    /// The X axis display mode.
+    pub fn time_axis(&self) -> TimeAxisMode {
+        *self.time_axis.borrow()
+    }
+
+    /// Switch the X axis between seconds and ticks.
+    pub fn set_time_axis(&self, mode: TimeAxisMode) {
+        *self.time_axis.borrow_mut() = mode;
+        self.apply_time_axis_formatter();
+        self.request_redraw();
+    }
+
+    /// Ticks per beat for tick-axis display and tick conversions.
+    pub fn ticks_per_beat(&self) -> u32 {
+        self.ticks_per_beat.get()
+    }
+
+    /// Set ticks per beat.
+    pub fn set_ticks_per_beat(&self, tpb: u32) {
+        self.ticks_per_beat.set(tpb);
         self.request_redraw();
     }
 

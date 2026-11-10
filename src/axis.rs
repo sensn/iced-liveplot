@@ -100,6 +100,11 @@ impl AxisConfig {
         &self.formatter
     }
 
+    /// Replace the formatter (e.g. switching seconds <-> ticks).
+    pub fn set_formatter(&mut self, formatter: AxisFormatter) {
+        self.formatter = formatter;
+    }
+
     /// Format a value for display using the configured formatter.
     pub fn format_value(&self, value: f64) -> String {
         self.formatter.format(value)

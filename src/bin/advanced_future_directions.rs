@@ -80,6 +80,12 @@ enum Message {
     SetSnapDivision(u32),
     // Tools
     SetTool(Tool),
+    // Domain selection (sidebar)
+    SetDomain(iced_liveplot::widget::Domain),
+    // MIDI note length picker (pen tool)
+    SetNoteLength(iced_liveplot::widget::NoteLength),
+    // X axis mode (ticks vs seconds)
+    ToggleTimeAxis,
     // Undo/Redo
     Undo,
     Redo,
@@ -102,13 +108,27 @@ struct LinkedSeries {
     signal: Option<iced_liveplot::series::SeriesId>,
 }
 
-/// A tool interaction worth logging.
+/// A tool interaction worth logging / applying app-side.
 #[derive(Debug, Clone)]
 enum ToolLog {
     Point(f64, f64),
     RegionDeleted(u64),
     RegionSplit(u64, f64),
     Moved(f64, f64),
+    /// MIDI domain pen: insert a note.
+    MidiNote(u8, f64, f64),
+    /// Audio domain pen: insert a clip.
+    AudioClip(f64, f64),
+    /// Automation domain pen: insert a point.
+    AutoPoint(f64, f64),
+    /// Markers domain pen: drop a marker.
+    Marker(f64),
+    /// Move a region by dt (seconds) and dy (semitones).
+    RegionMoved(u64, f64, u8),
+    /// Resize a region edge to a new time.
+    RegionResized(u64, bool, f64),
+    /// Box select: select all regions intersecting the rect.
+    BoxSelect(f64, f64, f64, f64),
     Message(String),
 }
 
@@ -305,12 +325,44 @@ impl AdvancedApp {
                     buf.push(ToolLog::Point(point.x, point.y));
                     true
                 }
+                ToolEvent::InsertMidiNote { pitch, velocity: _, start, duration } => {
+                    buf.push(ToolLog::MidiNote(pitch, start, duration));
+                    true
+                }
+                ToolEvent::InsertAudioClip { start, duration } => {
+                    buf.push(ToolLog::AudioClip(start, duration));
+                    true
+                }
+                ToolEvent::InsertAutomationPoint { time, value } => {
+                    buf.push(ToolLog::AutoPoint(time, value));
+                    true
+                }
+                ToolEvent::InsertMarker { time } => {
+                    buf.push(ToolLog::Marker(time));
+                    true
+                }
+                ToolEvent::SetLoopRegion { start, end } => {
+                    buf.push(ToolLog::Message(format!("Loop {}-{}s", start, end)));
+                    true
+                }
                 ToolEvent::DeleteRegion { region } => {
                     buf.push(ToolLog::RegionDeleted(region.0));
                     true
                 }
                 ToolEvent::SplitRegion { region, time } => {
                     buf.push(ToolLog::RegionSplit(region.0, time));
+                    true
+                }
+                ToolEvent::MoveRegion { region, dt, dy } => {
+                    buf.push(ToolLog::RegionMoved(region.0, dt, dy));
+                    true
+                }
+                ToolEvent::ResizeRegion { region, edge, time } => {
+                    buf.push(ToolLog::RegionResized(region.0, edge == iced_liveplot::widget::ResizeEdge::Start, time));
+                    true
+                }
+                ToolEvent::BoxSelect { x0, x1, y0, y1 } => {
+                    buf.push(ToolLog::BoxSelect(x0, x1, y0, y1));
                     true
                 }
                 ToolEvent::MoveSelection { dx, dy } => {
@@ -657,13 +709,47 @@ impl AdvancedApp {
         for event in events {
             match event {
                 ToolLog::Point(x, y) => {
-                    // Pen tool inserted a point: add an automation region at (x, y)
-                    // (automation is the natural "insert a point" lane in this demo)
-                    let v = y.clamp(0.0, 1.0);
+                    // Generic pen: follow the active domain
+                    match self.program.domain() {
+                        iced_liveplot::widget::Domain::Midi => {
+                            let pitch = y.round().clamp(0.0, 127.0) as u8;
+                            let dur = self.program.note_length().seconds(120.0);
+                            self.add_midi_note(pitch, x, dur, 100);
+                        }
+                        iced_liveplot::widget::Domain::Audio => {
+                            let dur = self.program.note_length().seconds(120.0) * 4.0;
+                            self.add_audio_region(x, dur);
+                        }
+                        iced_liveplot::widget::Domain::Automation => {
+                            let v = y.clamp(0.0, 1.0);
+                            let curve = if v > 0.7 { CurveType::Exponential }
+                                        else if v < 0.3 { CurveType::SCurve }
+                                        else { CurveType::Linear };
+                            self.add_automation_point("filter_cutoff".to_string(), x, v, curve);
+                        }
+                        iced_liveplot::widget::Domain::Markers => {
+                            self.add_marker(format!("M {:.2}s", x), x);
+                        }
+                        iced_liveplot::widget::Domain::Loop => {
+                            self.set_loop(x, x + 4.0);
+                        }
+                    }
+                }
+                ToolLog::MidiNote(pitch, start, duration) => {
+                    self.add_midi_note(pitch, start, duration, 100);
+                }
+                ToolLog::AudioClip(start, duration) => {
+                    self.add_audio_region(start, duration);
+                }
+                ToolLog::AutoPoint(time, value) => {
+                    let v = value.clamp(0.0, 1.0);
                     let curve = if v > 0.7 { CurveType::Exponential }
                                 else if v < 0.3 { CurveType::SCurve }
                                 else { CurveType::Linear };
-                    self.add_automation_point("filter_cutoff".to_string(), x, v, curve);
+                    self.add_automation_point("filter_cutoff".to_string(), time, v, curve);
+                }
+                ToolLog::Marker(time) => {
+                    self.add_marker(format!("M {:.2}s", time), time);
                 }
                 ToolLog::RegionDeleted(id) => {
                     self.program.with_plot_mut(|plot| plot.remove_region(RegionId(id)));
@@ -674,7 +760,16 @@ impl AdvancedApp {
                     self.log_action(format!("Eraser: removed region #{}", id));
                 }
                 ToolLog::RegionSplit(id, time) => {
-                    self.log_action(format!("Split region #{} at {:.2}s (mirrored: original kept)", id, time));
+                    self.split_region(RegionId(id), time);
+                }
+                ToolLog::RegionMoved(id, dt, dy) => {
+                    self.move_region(RegionId(id), dt, dy);
+                }
+                ToolLog::RegionResized(id, is_start, time) => {
+                    self.resize_region(RegionId(id), is_start, time);
+                }
+                ToolLog::BoxSelect(x0, x1, y0, y1) => {
+                    self.box_select(x0, x1, y0, y1);
                 }
                 ToolLog::Moved(dx, dy) => {
                     self.log_action(format!("Moved selection by ({:.2}, {:.2})", dx, dy));
@@ -684,6 +779,137 @@ impl AdvancedApp {
                 }
             }
         }
+    }
+    
+    /// Split a region at `time` (MIDI notes and audio clips).
+    fn split_region(&mut self, id: RegionId, time: f64) {
+        let region = self.program.plot().regions().iter().find(|r| r.id == id).cloned();
+        let Some(region) = region else { return };
+        match &region.kind {
+            RegionKind::MidiNote { pitch, velocity, channel, start, end } => {
+                if time <= *start || time >= *end {
+                    self.log_action("Split: outside note".into());
+                    return;
+                }
+                let (p, v, c, s, e) = (*pitch, *velocity, *channel, *start, *end);
+                self.program.with_plot_mut(|plot| plot.remove_region(id));
+                let mut a = DataRegion::midi_note(p, v, c, s, time);
+                let mut b = DataRegion::midi_note(p, v, c, time, e);
+                a.series = region.series;
+                b.series = region.series;
+                self.program.with_plot_mut(|plot| {
+                    plot.add_region(a);
+                    plot.add_region(b);
+                });
+                self.log_action(format!("Split MIDI note at {:.2}s", time));
+            }
+            RegionKind::AudioRegion { start, duration, .. } => {
+                let (s, d) = (*start, *duration);
+                if time <= s || time >= s + d {
+                    self.log_action("Split: outside clip".into());
+                    return;
+                }
+                self.program.with_plot_mut(|plot| plot.remove_region(id));
+                let mut a = AudioRegion::new(AudioSource::File { path: "split_a.wav".into(), channel: 0 }, s, time - s);
+                let mut b = AudioRegion::new(AudioSource::File { path: "split_b.wav".into(), channel: 0 }, time, s + d - time);
+                let mut ra = a.to_data_region();
+                let mut rb = b.to_data_region();
+                ra.series = region.series;
+                rb.series = region.series;
+                let (ra, rb) = (ra, rb);
+                self.program.with_plot_mut(|plot| {
+                    plot.add_region(ra);
+                    plot.add_region(rb);
+                });
+                self.log_action(format!("Split audio clip at {:.2}s", time));
+            }
+            _ => self.log_action("Split: unsupported region kind".into()),
+        }
+    }
+    
+    /// Move a region by `dt` seconds and `dy` semitones.
+    fn move_region(&mut self, id: RegionId, dt: f64, dy: u8) {
+        self.program.with_plot_mut(|plot| {
+            if let Some(region) = plot.regions_mut().iter_mut().find(|r| r.id == id) {
+                match &mut region.kind {
+                    RegionKind::MidiNote { start, end, pitch, .. } => {
+                        *start = (*start + dt).max(0.0);
+                        *end = (*end + dt).max(0.0);
+                        *pitch = pitch.saturating_add(dy).min(127).max(0);
+                    }
+                    RegionKind::AudioRegion { start, .. } => {
+                        *start = (*start + dt).max(0.0);
+                    }
+                    RegionKind::AutomationPoint { time, .. } => {
+                        *time = (*time + dt).max(0.0);
+                    }
+                    RegionKind::Marker { time, .. } => {
+                        *time = (*time + dt).max(0.0);
+                    }
+                    RegionKind::Loop { start, end } => {
+                        *start = (*start + dt).max(0.0);
+                        *end = (*end + dt).max(0.0);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        self.log_action(format!("Moved region #{} by {:.2}s (+{} st)", id.0, dt, dy));
+    }
+    
+    /// Resize a region edge (start or end) to `time`.
+    fn resize_region(&mut self, id: RegionId, is_start: bool, time: f64) {
+        self.program.with_plot_mut(|plot| {
+            if let Some(region) = plot.regions_mut().iter_mut().find(|r| r.id == id) {
+                match &mut region.kind {
+                    RegionKind::MidiNote { start, end, .. } => {
+                        if is_start {
+                            *start = time.min(*end - 0.01).max(0.0);
+                        } else {
+                            *end = time.max(*start + 0.01);
+                        }
+                    }
+                    RegionKind::AudioRegion { start, duration, .. } => {
+                        if is_start {
+                            let end = *start + *duration;
+                            let new_start = time.min(end - 0.01).max(0.0);
+                            *duration = end - new_start;
+                            *start = new_start;
+                        } else {
+                            *duration = (time - *start).max(0.01);
+                        }
+                    }
+                    RegionKind::Loop { start, end } => {
+                        if is_start {
+                            *start = time.min(*end - 0.01).max(0.0);
+                        } else {
+                            *end = time.max(*start + 0.01);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+        self.log_action(format!("Resized region #{} {} to {:.2}s", id.0, if is_start { "start" } else { "end" }, time));
+    }
+    
+    /// Select all regions intersecting the data-space box.
+    fn box_select(&mut self, x0: f64, x1: f64, y0: f64, y1: f64) {
+        let (x_min, x_max) = if x0 <= x1 { (x0, x1) } else { (x1, x0) };
+        let (y_min, y_max) = if y0 <= y1 { (y0, y1) } else { (y1, y0) };
+        let mut count = 0;
+        self.program.with_plot_mut(|plot| {
+            for region in plot.regions_mut() {
+                let inside = region.time_range().is_some_and(|t| t.max >= x_min && t.min <= x_max);
+                if inside {
+                    region.selected = true;
+                    self.selection.regions.insert(region.id);
+                    count += 1;
+                }
+            }
+        });
+        let _ = (y_min, y_max);
+        self.log_action(format!("Box select: {} regions in [{:.1}, {:.1}]", count, x_min, x_max));
     }
     
     // ========================================================================
@@ -767,6 +993,22 @@ impl AdvancedApp {
                 self.tool_state.set_tool(tool);
                 self.program.set_tool(tool);
                 self.log_action(format!("Tool: {} (cursor updated)", tool.name()));
+            }
+            Message::SetDomain(domain) => {
+                self.program.set_domain(domain);
+                self.log_action(format!("Domain: {} (Y axis + tool behavior updated)", domain.name()));
+            }
+            Message::SetNoteLength(len) => {
+                self.program.set_note_length(len);
+                self.log_action(format!("Note length: {}", len.label()));
+            }
+            Message::ToggleTimeAxis => {
+                let next = match self.program.time_axis() {
+                    iced_liveplot::widget::TimeAxisMode::Seconds => iced_liveplot::widget::TimeAxisMode::Ticks,
+                    iced_liveplot::widget::TimeAxisMode::Ticks => iced_liveplot::widget::TimeAxisMode::Seconds,
+                };
+                self.program.set_time_axis(next);
+                self.log_action(format!("X axis: {:?}", next));
             }
             Message::Undo => {
                 self.undo();
@@ -884,6 +1126,15 @@ impl AdvancedApp {
     fn build_controls(&self) -> impl iced::Widget<Message> + use<'_> {
         container(
             column![
+                // Domain selector
+                text("Domain (tool behavior)").size(18),
+                self.domain_row(),
+                
+                // MIDI note length (pen tool)
+                self.note_length_row(),
+                
+                rule::horizontal(2),
+                
                 // Domain Controls
                 text("Domain Controls").size(18),
                 self.control_row("MIDI:", vec![
@@ -962,6 +1213,10 @@ impl AdvancedApp {
                 text("View").size(18),
                 self.control_row("", vec![
                     ("Reset View", Message::Plot(PlotMessage::ResetView)),
+                    (match self.program.time_axis() {
+                        iced_liveplot::widget::TimeAxisMode::Seconds => "X: seconds",
+                        iced_liveplot::widget::TimeAxisMode::Ticks => "X: ticks",
+                    }, Message::ToggleTimeAxis),
                 ]),
                 
                 rule::horizontal(2),
@@ -1003,6 +1258,40 @@ impl AdvancedApp {
             },
             ..Default::default()
         })
+    }
+    
+    /// Sidebar: domain selector row — buttons highlight the active domain.
+    fn domain_row(&self) -> iced::Element<'_, Message> {
+        let active = self.program.domain();
+        let buttons: Vec<(&str, Message)> = iced_liveplot::widget::Domain::all()
+            .iter()
+            .map(|d| {
+                let label = if *d == active {
+                    format!("[{}]", d.name())
+                } else {
+                    d.name().to_string()
+                };
+                (Box::leak(label.into_boxed_str()) as &'static str, Message::SetDomain(*d))
+            })
+            .collect();
+        self.control_row("", buttons)
+    }
+    
+    /// Sidebar: MIDI note length picker for the pen tool.
+    fn note_length_row(&self) -> iced::Element<'_, Message> {
+        let active = self.program.note_length();
+        let buttons: Vec<(&str, Message)> = iced_liveplot::widget::NoteLength::all()
+            .iter()
+            .map(|l| {
+                let label = if *l == active {
+                    format!("[{}]", l.label())
+                } else {
+                    l.label().to_string()
+                };
+                (Box::leak(label.into_boxed_str()) as &'static str, Message::SetNoteLength(*l))
+            })
+            .collect();
+        self.control_row("Note len:", buttons)
     }
     
     fn control_row<'a>(&self, label: &'a str, buttons: Vec<(&'a str, Message)>) -> iced::Element<'a, Message> {

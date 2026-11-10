@@ -915,6 +915,47 @@ fn draw_region_body(
                 });
             }
         }
+        // Resize handles on start/end edges for span regions (MIDI notes,
+        // audio clips, loop): small white squares visible when hovered or
+        // selected — the Scale/Stretch tools drag them.
+        let has_edges = matches!(
+            region.kind,
+            crate::region::RegionKind::MidiNote { .. }
+                | crate::region::RegionKind::AudioRegion { .. }
+                | crate::region::RegionKind::Loop { .. }
+        );
+        if has_edges && region.selected {
+            let handle_w = 4.0;
+            let handle_h = clipped_bounds.height().min(14.0).max(8.0);
+            let handle_color = SerializableColor::new(1.0, 0.9, 0.4, 1.0).to_iced();
+            // Start handle
+            let start_handle = ScreenRect::new(
+                ScreenPoint::new(clipped_bounds.min.x - 1.0, (clipped_bounds.min.y + clipped_bounds.max.y) / 2.0 - handle_h / 2.0),
+                ScreenPoint::new(clipped_bounds.min.x + handle_w, (clipped_bounds.min.y + clipped_bounds.max.y) / 2.0 + handle_h / 2.0),
+            );
+            render.push(RenderCommand::Rect {
+                rect: start_handle,
+                style: RectStyle {
+                    fill: handle_color,
+                    stroke: Color::BLACK,
+                    stroke_width: 1.0,
+                },
+            });
+            // End handle
+            let end_handle = ScreenRect::new(
+                ScreenPoint::new(clipped_bounds.max.x - handle_w, (clipped_bounds.min.y + clipped_bounds.max.y) / 2.0 - handle_h / 2.0),
+                ScreenPoint::new(clipped_bounds.max.x + 1.0, (clipped_bounds.min.y + clipped_bounds.max.y) / 2.0 + handle_h / 2.0),
+            );
+            render.push(RenderCommand::Rect {
+                rect: end_handle,
+                style: RectStyle {
+                    fill: handle_color,
+                    stroke: Color::BLACK,
+                    stroke_width: 1.0,
+                },
+            });
+        }
+        
         // Draw selection highlight
         if region.selected {
             let highlight_bounds = ScreenRect::new(

@@ -77,6 +77,16 @@ impl Plot {
         &self.y_axis
     }
 
+    /// Mutably access the X axis configuration.
+    pub fn x_axis_mut(&mut self) -> &mut AxisConfig {
+        &mut self.x_axis
+    }
+
+    /// Mutably access the Y axis configuration.
+    pub fn y_axis_mut(&mut self) -> &mut AxisConfig {
+        &mut self.y_axis
+    }
+
     /// Access the active view mode.
     pub fn view(&self) -> View {
         self.view

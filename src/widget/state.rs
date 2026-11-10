@@ -20,6 +20,8 @@ pub(crate) enum DragMode {
     ZoomRect,
     ZoomX,
     ZoomY,
+    /// Select tool rubber band (left drag) — selects regions inside.
+    BoxSelect,
 }
 
 #[derive(Debug, Clone)]

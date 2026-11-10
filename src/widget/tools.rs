@@ -167,6 +167,8 @@ pub struct ToolState {
     pub current_tool: Tool,
     pub gesture: ToolGesture,
     pub last_cursor: Option<crate::geom::ScreenPoint>,
+    /// (region id, grab x, grab y) while a Move/Resize drag is in progress.
+    pub move_gesture: Option<(crate::region::RegionId, f64, f64)>,
 }
 
 impl Default for ToolState {
@@ -175,6 +177,7 @@ impl Default for ToolState {
             current_tool: Tool::Select,
             gesture: ToolGesture::None,
             last_cursor: None,
+            move_gesture: None,
         }
     }
 }

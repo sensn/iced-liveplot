@@ -19,7 +19,7 @@ use crate::view::Viewport;
 use super::hover::update_hover_target;
 use super::state::{ClickState, DragMode, DragState, LastClick, PlotUiState};
 use super::tools::{ToolGesture, ToolState};
-use super::{Message, Program, Tool, ToolEvent};
+use super::{Message, Program, ResizeEdge, Tool, ToolEvent};
 
 /// Scroll wheel line height in pixels (matches the GPUI backend default).
 const SCROLL_LINE_HEIGHT: f32 = 16.0;
@@ -193,14 +193,12 @@ fn handle_mouse_down(
     // ---- TOOLS: active tool hijacks left-drag inside the plot area ----
     if button == mouse::Button::Left && region == HitRegion::Plot {
         let tool = program.current_tool();
-        if !matches!(tool, Tool::Select) {
-            run_tool_mouse(program, state, tool, pos, ToolPhase::Down);
-            // Still track a drag for gesture-based tools (Move/Scale/Stretch)
-            if matches!(tool, Tool::Move | Tool::Scale | Tool::Stretch | Tool::Line | Tool::Curve) {
-                state.drag = Some(DragState::new(DragMode::Pan, pos, true));
-            }
+        run_tool_mouse(program, state, tool, pos, ToolPhase::Down);
+        if tool != Tool::Select {
             return;
         }
+        // Select tool: run_tool_mouse started a BoxSelect drag; fall through
+        // so pending_click logic still applies on release.
     }
 
     let (mode, active) = match (button, region) {
@@ -332,10 +330,10 @@ fn handle_mouse_move(
     // ---- TOOLS: feed move to active tool while dragging ----
     let tool_dragging = state.drag.as_ref().is_some_and(|d| d.active);
     let tool = program.current_tool();
-    if tool_dragging && !matches!(tool, Tool::Select) && hit_region == HitRegion::Plot {
+    if tool_dragging && hit_region == HitRegion::Plot {
         run_tool_mouse(program, state, tool, pos, ToolPhase::Move);
-        if matches!(tool, Tool::Draw) {
-            // Freehand consumes the move; no pan
+        if matches!(tool, Tool::Draw | Tool::Select | Tool::Move | Tool::Scale | Tool::Stretch) {
+            // These tools consume the move; no pan
             state.pending_click = None;
             return;
         }
@@ -393,7 +391,7 @@ fn handle_mouse_move(
                     let center = transform.screen_to_data(pos).unwrap_or_else(|| viewport_center(&viewport));
                     Some(zoom_viewport(viewport, center, 1.0, factor))
                 }
-                DragMode::ZoomRect => unreachable!("handled above"),
+                DragMode::ZoomRect | DragMode::BoxSelect => unreachable!("handled above"),
             };
 
             if let Some(next) = next {
@@ -426,13 +424,16 @@ fn handle_mouse_up(
 
     // ---- TOOLS: finish tool gesture (before zoom-rect / double-click logic) ----
     let tool = program.current_tool();
-    if !matches!(tool, Tool::Select) && button == mouse::Button::Left {
+    if button == mouse::Button::Left {
         if let Some(pos) = position {
+            let was_box = state.drag.as_ref().is_some_and(|d| d.mode == DragMode::BoxSelect && d.active);
             run_tool_mouse(program, state, tool, pos, ToolPhase::Up);
-            state.selection_rect = None;
-            state.last_click = None;
-            state.last_pin_toggle = None;
-            return Some(canvas::Action::request_redraw());
+            if tool != Tool::Select || was_box {
+                state.selection_rect = None;
+                state.last_click = None;
+                state.last_pin_toggle = None;
+                return Some(canvas::Action::request_redraw());
+            }
         }
     }
 
@@ -591,7 +592,7 @@ pub(crate) fn run_tool_mouse(
     let raw_point = transform.screen_to_data(pos).unwrap_or(crate::geom::Point::new(0.0, 0.0));
 
     // Snap the point using the program's snap engine
-    let (snapped_point, did_snap) = program.with_snap(|snap| {
+    let (snapped_point, _did_snap) = program.with_snap(|snap| {
         let regions: Vec<crate::region::DataRegion> = program.plot().regions().to_vec();
         let view_range = program
             .plot()
@@ -601,15 +602,119 @@ pub(crate) fn run_tool_mouse(
         let result = snap.snap(raw_point, &regions, &transform, view_range, 120.0);
         (result.point, result.snapped)
     });
-    let _ = did_snap;
 
     let screen = pos;
+
+    // ---- SELECT tool: rubber band starts on down, extends on move, commits on up ----
+    if tool == Tool::Select {
+        match phase {
+            ToolPhase::Down => {
+                state.drag = Some(DragState::new(DragMode::BoxSelect, pos, true));
+                state.selection_rect = Some(crate::geom::ScreenRect::new(pos, pos));
+            }
+            ToolPhase::Move => {
+                if let Some(d) = state.drag.as_mut() {
+                    if d.mode == DragMode::BoxSelect {
+                        d.last = pos;
+                        state.selection_rect = Some(crate::geom::ScreenRect::new(d.start, pos));
+                    }
+                }
+            }
+            ToolPhase::Up => {
+                if let (Some(rect), Some(transform)) = (state.selection_rect.take(), state.transform.clone()) {
+                    let norm = super::geometry::normalized_rect(rect);
+                    if let (Some(p0), Some(p1)) = (
+                        transform.screen_to_data(norm.min),
+                        transform.screen_to_data(norm.max),
+                    ) {
+                        let (x0, x1) = if p0.x <= p1.x { (p0.x, p1.x) } else { (p1.x, p0.x) };
+                        let (y0, y1) = if p0.y <= p1.y { (p0.y, p1.y) } else { (p1.y, p0.y) };
+                        program.emit_tool_event(ToolEvent::BoxSelect { x0, x1, y0, y1 });
+                    }
+                }
+                state.drag = None;
+            }
+        }
+        return;
+    }
+
+    // ---- MOVE tool: press on a region, drag it, release commits MoveRegion ----
+    if tool == Tool::Move {
+        match phase {
+            ToolPhase::Down => {
+                let region = region_at(program, &transform, snapped_point);
+                program.with_tool_state(|ts| {
+                    ts.move_gesture = region.map(|r| (r.id, snapped_point.x, snapped_point.y));
+                    ts.gesture = ToolGesture::Drag {
+                        start: snapped_point,
+                        start_screen: screen,
+                        current: snapped_point,
+                        current_screen: screen,
+                    };
+                });
+            }
+            ToolPhase::Up => {
+                let held = program.with_tool_state(|ts| ts.move_gesture.take());
+                program.with_tool_state(|ts| ts.gesture = ToolGesture::None);
+                if let (Some((id, grab_x, grab_y)), Some(transform)) = (held, state.transform.clone()) {
+                    if let Some(end) = transform.screen_to_data(screen) {
+                        let _ = grab_x;
+                        let dy = (end.y - grab_y).round().clamp(-64.0, 64.0) as i64;
+                        program.emit_tool_event(ToolEvent::MoveRegion {
+                            region: id,
+                            dt: end.x - grab_x,
+                            dy: dy as u8,
+                        });
+                    }
+                }
+            }
+            ToolPhase::Move => {}
+        }
+        return;
+    }
+
+    // ---- RESIZE: Move tool variant handled above; dedicated handles use
+    // Scale/Stretch as edge-drag (Scale = start edge, Stretch = end edge) ----
+    if tool == Tool::Scale || tool == Tool::Stretch {
+        let edge = if tool == Tool::Scale { ResizeEdge::Start } else { ResizeEdge::End };
+        match phase {
+            ToolPhase::Down => {
+                let region = region_at(program, &transform, snapped_point);
+                program.with_tool_state(|ts| {
+                    ts.move_gesture = region.map(|r| (r.id, snapped_point.x, snapped_point.y));
+                    ts.gesture = ToolGesture::Drag {
+                        start: snapped_point,
+                        start_screen: screen,
+                        current: snapped_point,
+                        current_screen: screen,
+                    };
+                });
+            }
+            ToolPhase::Up => {
+                let held = program.with_tool_state(|ts| ts.move_gesture.take());
+                program.with_tool_state(|ts| ts.gesture = ToolGesture::None);
+                if let (Some((id, _, _)), Some(transform)) = (held, state.transform.clone()) {
+                    if let Some(end) = transform.screen_to_data(screen) {
+                        program.emit_tool_event(ToolEvent::ResizeRegion {
+                            region: id,
+                            edge,
+                            time: end.x,
+                        });
+                    }
+                }
+            }
+            ToolPhase::Move => {}
+        }
+        return;
+    }
+
+    // ---- Other tools: generic gesture tracking + finish ----
     program.with_tool_state(|ts| {
         match phase {
             ToolPhase::Down => {
                 match tool {
                     Tool::Pen | Tool::Eraser | Tool::Split => ts.start_click(snapped_point, screen),
-                    Tool::Move | Tool::Scale | Tool::Stretch | Tool::Line | Tool::Curve => {
+                    Tool::Join | Tool::Velocity | Tool::Quantize => {
                         ts.start_drag(snapped_point, screen)
                     }
                     Tool::Draw => ts.start_draw(snapped_point),
@@ -618,11 +723,11 @@ pub(crate) fn run_tool_mouse(
             }
             ToolPhase::Move => {
                 match ts.gesture_mut() {
-                    super::tools::ToolGesture::Drag { current, current_screen, .. } => {
+                    ToolGesture::Drag { current, current_screen, .. } => {
                         *current = snapped_point;
                         *current_screen = screen;
                     }
-                    super::tools::ToolGesture::Draw { points } => {
+                    ToolGesture::Draw { points } => {
                         points.push(snapped_point);
                     }
                     _ => {}
@@ -642,37 +747,25 @@ fn finish_tool_gesture(
     ts: &mut ToolState,
     transform: &crate::transform::Transform,
 ) {
+    let _ = transform;
     match tool {
         Tool::Pen => {
-            if let super::tools::ToolGesture::Click { position, .. } =
-                std::mem::replace(&mut ts.gesture, super::tools::ToolGesture::None)
+            if let ToolGesture::Click { position, .. } =
+                std::mem::replace(&mut ts.gesture, ToolGesture::None)
             {
-                // Find the first visible series to insert into (host may ignore)
-                let series_id = program
-                    .plot()
-                    .series()
-                    .iter()
-                    .find(|s| s.is_visible())
-                    .map(|s| s.id());
-                if let Some(series) = series_id {
-                    program.emit_tool_event(ToolEvent::InsertPoint { series, point: position });
-                } else {
-                    program.emit_tool_event(ToolEvent::Notify(
-                        "Pen: no visible series to insert into".into(),
-                    ));
-                }
+                emit_domain_pen(program, position);
             }
         }
         Tool::Eraser => {
-            if let super::tools::ToolGesture::Click { position, .. } =
-                std::mem::replace(&mut ts.gesture, super::tools::ToolGesture::None)
+            if let ToolGesture::Click { position, .. } =
+                std::mem::replace(&mut ts.gesture, ToolGesture::None)
             {
                 erase_at(program, transform, position);
             }
         }
         Tool::Split => {
-            if let super::tools::ToolGesture::Click { position, .. } =
-                std::mem::replace(&mut ts.gesture, super::tools::ToolGesture::None)
+            if let ToolGesture::Click { position, .. } =
+                std::mem::replace(&mut ts.gesture, ToolGesture::None)
             {
                 if let Some(region) = region_at(program, transform, position) {
                     program.emit_tool_event(ToolEvent::SplitRegion {
@@ -682,78 +775,62 @@ fn finish_tool_gesture(
                 }
             }
         }
-        Tool::Select => {
-            if let super::tools::ToolGesture::Drag { start, current, .. } =
-                std::mem::replace(&mut ts.gesture, super::tools::ToolGesture::None)
-            {
-                let dx = current.x - start.x;
-                let dy = current.y - start.y;
-                let _ = (dx, dy);
-            }
-        }
-        Tool::Move => {
-            if let super::tools::ToolGesture::Drag { start, current, .. } =
-                std::mem::replace(&mut ts.gesture, super::tools::ToolGesture::None)
-            {
-                program.emit_tool_event(ToolEvent::MoveSelection {
-                    dx: current.x - start.x,
-                    dy: current.y - start.y,
-                });
-            }
-        }
-        Tool::Draw => {
-            if let super::tools::ToolGesture::Draw { points } =
-                std::mem::replace(&mut ts.gesture, super::tools::ToolGesture::None)
-            {
-                if let Some(series) = program
-                    .plot()
-                    .series()
-                    .iter()
-                    .find(|s| s.is_visible())
-                    .map(|s| s.id())
-                {
-                    for point in points {
-                        program.emit_tool_event(ToolEvent::InsertPoint { series, point });
-                    }
-                }
-            }
-        }
-        Tool::Line | Tool::Curve => {
-            if let super::tools::ToolGesture::Drag { start, current, .. } =
-                std::mem::replace(&mut ts.gesture, super::tools::ToolGesture::None)
-            {
-                if let Some(series) = program
-                    .plot()
-                    .series()
-                    .iter()
-                    .find(|s| s.is_visible())
-                    .map(|s| s.id())
-                {
-                    // 8 interpolated points between start and end
-                    let steps = 8;
-                    for i in 0..=steps {
-                        let t = i as f64 / steps as f64;
-                        let point = crate::geom::Point::new(
-                            start.x + (current.x - start.x) * t,
-                            start.y + (current.y - start.y) * t,
-                        );
-                        program.emit_tool_event(ToolEvent::InsertPoint { series, point });
-                    }
-                }
-            }
+        Tool::Join | Tool::Velocity | Tool::Quantize => {
+            program.with_tool_state(|t| t.gesture = ToolGesture::None);
         }
         _ => {
-            ts.gesture = super::tools::ToolGesture::None;
+            ts.gesture = ToolGesture::None;
         }
     }
 }
 
-/// Find the region under the cursor (topmost).
+/// Emit the domain-specific pen insertion event for a click at `position`.
+fn emit_domain_pen(program: &Program, position: crate::geom::Point) {
+    match program.domain() {
+        crate::widget::Domain::Midi => {
+            let pitch = position.y.round().clamp(0.0, 127.0) as u8;
+            let bpm = 120.0;
+            let duration = program.note_length().seconds(bpm);
+            program.emit_tool_event(ToolEvent::InsertMidiNote {
+                pitch,
+                velocity: 100,
+                start: position.x,
+                duration,
+            });
+        }
+        crate::widget::Domain::Audio => {
+            let bpm = 120.0;
+            let duration = program.note_length().seconds(bpm) * 4.0;
+            program.emit_tool_event(ToolEvent::InsertAudioClip {
+                start: position.x,
+                duration,
+            });
+        }
+        crate::widget::Domain::Automation => {
+            program.emit_tool_event(ToolEvent::InsertAutomationPoint {
+                time: position.x,
+                value: position.y.clamp(0.0, 1.0),
+            });
+        }
+        crate::widget::Domain::Markers => {
+            program.emit_tool_event(ToolEvent::InsertMarker { time: position.x });
+        }
+        crate::widget::Domain::Loop => {
+            program.emit_tool_event(ToolEvent::Notify(format!(
+                "Loop: click start at {:.2}s (drag with Move to set end)",
+                position.x
+            )));
+        }
+    }
+}
+
+/// Find the region under the cursor (topmost, unlocked, visible).
 fn region_at(
     program: &Program,
     transform: &crate::transform::Transform,
     pos_data: crate::geom::Point,
 ) -> Option<crate::region::DataRegion> {
+    let _ = transform;
     let plot = program.plot();
     plot.regions()
         .iter()
@@ -766,7 +843,7 @@ fn region_at(
         .cloned()
 }
 
-/// Erase regions or points near the cursor.
+/// Erase the region under the cursor with a single click.
 fn erase_at(
     program: &Program,
     transform: &crate::transform::Transform,
@@ -785,10 +862,10 @@ fn erase_at(
         .find(|s| s.is_visible())
         .map(|s| s.id())
     {
-        let _ = transform;
         program.emit_tool_event(ToolEvent::DeletePoint { series: series_id, index: usize::MAX });
     }
 }
+
 
 fn handle_scroll(
     program: &Program,
