@@ -149,6 +149,27 @@ pub enum TimeAxisMode {
     Seconds,
     /// Show MIDI ticks (requires ticks-per-beat).
     Ticks,
+    /// Show musical position as `bar.beat` (requires ticks-per-beat).
+    Bars,
+}
+
+impl TimeAxisMode {
+    /// Cycle to the next display mode (for a single toggle button).
+    pub fn next(self) -> Self {
+        match self {
+            TimeAxisMode::Seconds => TimeAxisMode::Ticks,
+            TimeAxisMode::Ticks => TimeAxisMode::Bars,
+            TimeAxisMode::Bars => TimeAxisMode::Seconds,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            TimeAxisMode::Seconds => "seconds",
+            TimeAxisMode::Ticks => "ticks",
+            TimeAxisMode::Bars => "bars",
+        }
+    }
 }
 
 /// The plot widget program: owns the plot model and renders it on a canvas.
@@ -181,6 +202,12 @@ pub struct Program {
     pub(crate) time_axis: RefCell<TimeAxisMode>,
     /// Ticks per beat used when the axis shows ticks.
     pub(crate) ticks_per_beat: std::cell::Cell<u32>,
+    /// Beats per bar (time signature numerator; e.g. 4 for 4/4).
+    pub(crate) beats_per_bar: std::cell::Cell<u32>,
+    /// Playhead position in MIDI ticks (0 = start).
+    pub(crate) playhead_ticks: std::cell::Cell<u64>,
+    /// Transport clock driving the playhead.
+    pub(crate) clock: RefCell<crate::clock::Clock>,
 }
 
 /// Callback signature for tool-originated domain mutations.
@@ -210,7 +237,9 @@ pub enum ToolEvent {
     /// Split the region under the cursor at the given time.
     SplitRegion { region: crate::region::RegionId, time: f64 },
     /// Move a region by a time delta (ticks/seconds depending on domain).
-    MoveRegion { region: crate::region::RegionId, dt: f64, dy: u8 },
+    /// `dy` is the vertical delta in data units (semitones for MIDI,
+    /// unitless for automation) — signed, so negative moves DOWN.
+    MoveRegion { region: crate::region::RegionId, dt: f64, dy: i8 },
     /// Resize a region edge (start or end).
     ResizeRegion { region: crate::region::RegionId, edge: ResizeEdge, time: f64 },
     /// Move selection by a data-space delta.
@@ -246,6 +275,9 @@ impl Program {
             note_length: RefCell::new(NoteLength::Quarter),
             time_axis: RefCell::new(TimeAxisMode::default()),
             ticks_per_beat: std::cell::Cell::new(480),
+            beats_per_bar: std::cell::Cell::new(4),
+            playhead_ticks: std::cell::Cell::new(0),
+            clock: RefCell::new(crate::clock::Clock::with_ppq(120.0, 480)),
         }
     }
 
@@ -339,7 +371,7 @@ impl Program {
     /// Apply the X axis formatter for the current time-axis mode.
     fn apply_time_axis_formatter(&self) {
         let mode = *self.time_axis.borrow();
-        let tpb = self.ticks_per_beat.get();
+        let tpb = self.ticks_per_beat.get().max(1) as f64;
         self.with_plot_mut(|plot| match mode {
             TimeAxisMode::Seconds => {
                 plot.x_axis_mut().set_formatter(
@@ -348,7 +380,21 @@ impl Program {
             }
             TimeAxisMode::Ticks => {
                 plot.x_axis_mut().set_formatter(crate::axis::AxisFormatter::Custom(
-                    std::sync::Arc::new(move |v| format!("{}", (v * tpb as f64 * 2.0).round() as i64)),
+                    std::sync::Arc::new(move |v| format!("{}", (v * tpb * 2.0).round() as i64)),
+                ));
+            }
+            TimeAxisMode::Bars => {
+                let beats_per_bar = self.beats_per_bar.get().max(1) as f64;
+                plot.x_axis_mut().set_formatter(crate::axis::AxisFormatter::Custom(
+                    std::sync::Arc::new(move |v| {
+                        // seconds -> ticks -> beats -> bar.beat (time signature
+                        // numerator drives the bar length).
+                        let ticks = (v * tpb * 2.0).round() as i64;
+                        let beat = ticks as f64 / tpb;
+                        let bar = (beat / beats_per_bar).floor() as i64 + 1;
+                        let beat_in_bar = beat - (bar as f64 - 1.0) * beats_per_bar;
+                        format!("{}.{:03}", bar, (beat_in_bar * 1000.0).round() as i64)
+                    }),
                 ));
             }
         });
@@ -386,6 +432,84 @@ impl Program {
     pub fn set_ticks_per_beat(&self, tpb: u32) {
         self.ticks_per_beat.set(tpb);
         self.request_redraw();
+    }
+
+    /// Beats per bar for the musical position axis (time signature numerator).
+    pub fn beats_per_bar(&self) -> u32 {
+        self.beats_per_bar.get()
+    }
+
+    /// Set beats per bar and refresh the X axis formatter if it shows bars.
+    pub fn set_beats_per_bar(&self, beats: u32) {
+        self.beats_per_bar.set(beats.max(1));
+        self.apply_time_axis_formatter();
+        self.request_redraw();
+    }
+
+    /// Playhead position in ticks.
+    pub fn playhead_ticks(&self) -> u64 {
+        self.playhead_ticks.get()
+    }
+
+    /// Move the playhead to a tick position (and pause the clock reference).
+    pub fn set_playhead_ticks(&self, ticks: u64) {
+        self.playhead_ticks.set(ticks);
+        self.clock.borrow_mut().seek_ticks(ticks);
+        self.request_redraw();
+    }
+
+    /// Playhead position in seconds (uses the plot's time scale: 2 beats/sec
+    /// at 120 BPM => 1 tick = PPQ/2 per second, matching `PPQ` = 480).
+    pub fn playhead_seconds(&self) -> f64 {
+        let tpb = self.ticks_per_beat.get().max(1) as f64;
+        self.playhead_ticks.get() as f64 / (tpb * 2.0)
+    }
+
+    /// Move the playhead to a seconds position.
+    pub fn set_playhead_seconds(&self, seconds: f64) {
+        let tpb = self.ticks_per_beat.get().max(1) as f64;
+        let ticks = (seconds * tpb * 2.0).round().max(0.0) as u64;
+        self.set_playhead_ticks(ticks);
+    }
+
+    /// Advance the transport clock and move the playhead accordingly.
+    /// Returns the tick delta since the previous call (0 while stopped).
+    pub fn tick_transport(&self) -> u64 {
+        let delta = self.clock.borrow_mut().update();
+        if delta > 0 {
+            let next = self.playhead_ticks.get() + delta;
+            self.playhead_ticks.set(next);
+            self.request_redraw();
+        }
+        delta
+    }
+
+    /// Start/pause the transport.
+    pub fn play(&self) {
+        self.clock.borrow_mut().start();
+    }
+
+    pub fn pause(&self) {
+        self.clock.borrow_mut().stop();
+    }
+
+    pub fn is_playing(&self) -> bool {
+        self.clock.borrow().playing
+    }
+
+    /// Set the transport tempo.
+    pub fn set_transport_bpm(&self, bpm: f64) {
+        self.clock.borrow_mut().set_bpm(bpm);
+    }
+
+    /// Mutably access the transport clock.
+    pub fn clock_mut(&self) -> std::cell::RefMut<'_, crate::clock::Clock> {
+        self.clock.borrow_mut()
+    }
+
+    /// Read-only access to the transport clock.
+    pub fn clock(&self) -> std::cell::Ref<'_, crate::clock::Clock> {
+        self.clock.borrow()
     }
 
     /// Undo the last widget-level edit. Returns true when something was undone.
@@ -565,6 +689,7 @@ impl canvas::Program<Message> for Program {
             };
 
             let list = frame::build_frame(
+                self,
                 &mut self.plot.borrow_mut(),
                 &mut ui_state,
                 &self.config,

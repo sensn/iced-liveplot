@@ -122,6 +122,107 @@ impl HistoryGroup {
     }
 }
 
+/// Copy the given regions into the clipboard (no plot mutation).
+#[derive(Debug, Clone)]
+pub struct CopyRegions {
+    pub ids: Vec<crate::region::RegionId>,
+}
+
+impl PlotAction for CopyRegions {
+    fn name(&self) -> &'static str {
+        "CopyRegions"
+    }
+
+    fn execute(&self, ctx: &mut ActionContext<'_>) -> ActionResult {
+        ctx.clipboard.regions.clear();
+        for id in &self.ids {
+            if let Some(region) = ctx.plot.regions().iter().find(|r| r.id == *id) {
+                ctx.clipboard.regions.push(region.clone());
+            }
+        }
+        ActionResult::None
+    }
+
+    fn can_undo(&self) -> bool {
+        false
+    }
+}
+
+/// Paste the clipboard contents after the last clipboard region, with a
+/// step offset (in data units) so pastes don't stack exactly on top.
+#[derive(Debug, Clone)]
+pub struct PasteRegions {
+    pub offset: f64,
+}
+
+impl PasteRegions {
+    pub fn new(offset: f64) -> Self {
+        Self { offset }
+    }
+}
+
+impl PlotAction for PasteRegions {
+    fn name(&self) -> &'static str {
+        "PasteRegions"
+    }
+
+    fn execute(&self, ctx: &mut ActionContext<'_>) -> ActionResult {
+        if ctx.clipboard.regions.is_empty() {
+            return ActionResult::None;
+        }
+        // Offset pasted copies by a bar (or 4 beats worth) so they don't overlap
+        let step = if self.offset == 0.0 { 4.0 * 60.0 / 120.0 } else { self.offset };
+        let start = ctx
+            .clipboard
+            .regions
+            .iter()
+            .filter_map(|r| r.time_range().map(|t| t.max))
+            .fold(0.0, f64::max);
+        let pasted: Vec<crate::region::DataRegion> = ctx
+            .clipboard
+            .regions
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|mut region| {
+                let delta = start + step;
+                match &mut region.kind {
+                    crate::region::RegionKind::MidiNote { start, end, .. } => {
+                        *start += delta;
+                        *end += delta;
+                    }
+                    crate::region::RegionKind::AudioRegion { start, .. } => {
+                        *start += delta;
+                    }
+                    crate::region::RegionKind::AutomationPoint { time, .. } => {
+                        *time += delta;
+                    }
+                    crate::region::RegionKind::Marker { time, .. } => {
+                        *time += delta;
+                    }
+                    crate::region::RegionKind::Loop { start, end } => {
+                        *start += delta;
+                        *end += delta;
+                    }
+                    _ => {}
+                }
+                region
+            })
+            .collect();
+        let added = std::sync::Arc::new(AddRegions { regions: pasted });
+        added.execute(ctx)
+    }
+
+    fn can_undo(&self) -> bool {
+        true
+    }
+
+    fn undo(&self, ctx: &mut ActionContext<'_>) -> ActionResult {
+        ActionResult::Error(ActionError::NotReversible)
+    }
+}
+
 /// Action to add a pin at a specific index in a series.
 #[derive(Debug)]
 pub struct AddPin {
@@ -384,6 +485,109 @@ impl PlotAction for SetPoint {
         } else {
             ActionResult::Error(ActionError::NotReversible)
         }
+    }
+}
+
+/// Action adding regions to the plot (insert note/clip/marker/pen point).
+#[derive(Debug, Clone)]
+pub struct AddRegions {
+    pub regions: Vec<crate::region::DataRegion>,
+}
+
+impl PlotAction for AddRegions {
+    fn name(&self) -> &'static str {
+        "AddRegions"
+    }
+
+    fn execute(&self, ctx: &mut ActionContext<'_>) -> ActionResult {
+        for region in &self.regions {
+            ctx.plot.add_region(region.clone());
+        }
+        ActionResult::Redraw
+    }
+
+    fn can_undo(&self) -> bool {
+        true
+    }
+
+    fn undo(&self, ctx: &mut ActionContext<'_>) -> ActionResult {
+        for region in &self.regions {
+            ctx.plot.remove_region(region.id);
+        }
+        ActionResult::Redraw
+    }
+}
+
+/// Action removing regions from the plot, storing them for undo.
+#[derive(Debug, Clone)]
+pub struct RemoveRegions {
+    pub removed: Vec<crate::region::DataRegion>,
+}
+
+impl RemoveRegions {
+    /// Build the action from the regions currently in the plot matching `ids`.
+    pub fn capture(plot: &Plot, ids: &[crate::region::RegionId]) -> Self {
+        let mut removed = Vec::new();
+        for id in ids {
+            if let Some(region) = plot.regions().iter().find(|r| r.id == *id) {
+                removed.push(region.clone());
+            }
+        }
+        Self { removed }
+    }
+}
+
+impl PlotAction for RemoveRegions {
+    fn name(&self) -> &'static str {
+        "RemoveRegions"
+    }
+
+    fn execute(&self, ctx: &mut ActionContext<'_>) -> ActionResult {
+        for region in &self.removed {
+            ctx.plot.remove_region(region.id);
+        }
+        ActionResult::Redraw
+    }
+
+    fn can_undo(&self) -> bool {
+        true
+    }
+
+    fn undo(&self, ctx: &mut ActionContext<'_>) -> ActionResult {
+        for region in &self.removed {
+            ctx.plot.add_region(region.clone());
+        }
+        ActionResult::Redraw
+    }
+}
+
+/// Action restoring a region to a previous snapshot (undo of move/resize).
+#[derive(Debug, Clone)]
+pub struct RestoreRegions {
+    pub before: Vec<crate::region::DataRegion>,
+}
+
+impl PlotAction for RestoreRegions {
+    fn name(&self) -> &'static str {
+        "RestoreRegions"
+    }
+
+    fn execute(&self, ctx: &mut ActionContext<'_>) -> ActionResult {
+        for before in &self.before {
+            if let Some(region) = ctx
+                .plot
+                .regions_mut()
+                .iter_mut()
+                .find(|r| r.id == before.id)
+            {
+                *region = before.clone();
+            }
+        }
+        ActionResult::Redraw
+    }
+
+    fn can_undo(&self) -> bool {
+        false
     }
 }
 
@@ -665,9 +869,9 @@ mod tests {
     #[test]
     fn test_add_pin() {
         let mut plot = Plot::new();
-        let series = Series::new();
+        let series = crate::series::Series::scatter("test");
         let id = series.id();
-        plot.add_series(series);
+        plot.add_series(&series);
         
         let mut state = PlotUiState::default();
         let mut clipboard = Clipboard::default();
@@ -694,9 +898,9 @@ mod tests {
     #[test]
     fn test_toggle_pin() {
         let mut plot = Plot::new();
-        let series = Series::new();
+        let series = crate::series::Series::scatter("test");
         let id = series.id();
-        plot.add_series(series);
+        plot.add_series(&series);
         
         let mut state = PlotUiState::default();
         let mut clipboard = Clipboard::default();

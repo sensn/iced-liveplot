@@ -279,6 +279,14 @@ fn rect_contains(rect: crate::geom::ScreenRect, point: crate::geom::ScreenPoint)
 }
 
 #[cfg(test)]
+fn iced_liveplot_next_series_id() -> crate::series::SeriesId {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+    crate::series::SeriesId::from_raw(900_000 + id)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     
@@ -288,7 +296,7 @@ mod tests {
         assert!(sel.is_empty());
         
         let pin = Pin {
-            series: SeriesId::next(),
+            series: iced_liveplot_next_series_id(),
             index: 0,
         };
         
@@ -319,7 +327,7 @@ mod tests {
     #[test]
     fn test_point_selection() {
         let mut sel = Selection::new();
-        let series = SeriesId::new();
+        let series = iced_liveplot_next_series_id();
         
         sel.select_point(series, 5);
         assert!(sel.is_point_selected(series, 5));

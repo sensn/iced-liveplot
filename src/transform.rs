@@ -39,6 +39,11 @@ impl Transform {
         self.screen
     }
 
+    /// Span of the visible X axis in data units (seconds/ticks/...).
+    pub fn data_span_x(&self) -> f64 {
+        self.viewport.x.span()
+    }
+
     /// Map a data point into screen space.
     pub fn data_to_screen(&self, point: Point) -> Option<ScreenPoint> {
         if !point.x.is_finite() || !point.y.is_finite() {

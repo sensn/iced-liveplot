@@ -22,6 +22,17 @@ impl SeriesId {
     fn next() -> Self {
         Self(SERIES_ID_COUNTER.fetch_add(1, Ordering::Relaxed))
     }
+
+    /// Build a `SeriesId` from a raw numeric value (used by tests and
+    /// serialization bridges that receive ids from outside).
+    pub fn from_raw(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// The raw numeric value of this id.
+    pub fn raw(&self) -> u64 {
+        self.0
+    }
 }
 
 /// Series rendering kind.

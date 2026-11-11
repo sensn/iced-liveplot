@@ -17,6 +17,7 @@ pub mod style;
 pub mod transform;
 pub mod view;
 pub mod widget;
+pub mod clock;
 
 pub use automation::{AutomationLane, AutomationPoint, AutomationStyle, AutomationTrack, parameters};
 pub use audio::{AudioRegion, AudioTrack, WaveformStyle, render_waveform};

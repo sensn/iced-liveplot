@@ -177,6 +177,12 @@ pub struct ToolState {
     pub last_cursor: Option<crate::geom::ScreenPoint>,
     /// (region id, grab x, grab y) while a Move/Resize drag is in progress.
     pub move_gesture: Option<(crate::region::RegionId, f64, f64)>,
+    /// Regions selected via box-select — group edits (move/resize) apply to
+    /// all of them.
+    pub selected_regions: Vec<crate::region::RegionId>,
+    /// While a Move drag is active: edge grabbed (Some) → drag resizes that
+    /// edge instead of moving.
+    pub move_edge: Option<super::ResizeEdge>,
 }
 
 impl Default for ToolState {
@@ -186,6 +192,8 @@ impl Default for ToolState {
             gesture: ToolGesture::None,
             last_cursor: None,
             move_gesture: None,
+            selected_regions: Vec::new(),
+            move_edge: None,
         }
     }
 }

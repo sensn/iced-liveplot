@@ -141,7 +141,7 @@ fn refresh_layout(program: &Program, state: &mut PlotUiState, bounds: Rectangle)
 
     // `build_frame` also refreshes the plot's live viewport.
     program.with_plot_mut(|plot| {
-        let _frame = super::frame::build_frame(plot, &mut scratch, &config, bounds);
+        let _frame = super::frame::build_frame(program, plot, &mut scratch, &config, bounds);
     });
 
     // Persist the derived fields the event handlers need.
@@ -190,6 +190,18 @@ fn handle_mouse_down(
 
     let region = state.regions.hit_test(pos);
 
+    // ---- PLAYHEAD: click/drag on the X axis moves the transport playhead ----
+    if button == mouse::Button::Left && region == HitRegion::XAxis {
+        if let Some(transform) = state.transform.clone() {
+            if let Some(point) = transform.screen_to_data(pos) {
+                let tpb = program.ticks_per_beat().max(1) as f64;
+                let ticks = (point.x * tpb * 2.0).round().max(0.0) as u64;
+                program.set_playhead_ticks(ticks);
+                return;
+            }
+        }
+    }
+
     // ---- TOOLS: active tool hijacks left-drag inside the plot area ----
     // Grab is the default navigation tool and keeps the ORIGINAL behavior:
     // left-drag pans, click-on-data pins, right-drag box zooms (below).
@@ -197,11 +209,14 @@ fn handle_mouse_down(
         let tool = program.current_tool();
         if tool != Tool::Grab {
             run_tool_mouse(program, state, tool, pos, ToolPhase::Down);
-            if tool != Tool::Select {
+            // Tools consume the interaction completely. The Select tool's
+            // BoxSelect drag (started above) must NOT be overwritten below,
+            // otherwise panning replaces the rubber band on the first move.
+            if tool == Tool::Select {
+                state.pending_click = Some(ClickState { region, button });
                 return;
             }
-            // Select tool: run_tool_mouse started a BoxSelect drag; fall through
-            // so pending_click logic still applies on release.
+            return;
         }
     }
 
@@ -259,8 +274,6 @@ fn handle_mouse_move(
     // --- PRÄZISE HITREGION-WEICHE MIT INTEGRATION DES UNGETEILTEN PLOT-FLAGS ---
     match hit_region {
         HitRegion::Plot => {
-            // --- DEBUG-PRINT: AUSLESEN DER AKTUELLEN PLOT ID ---
-            println!("[DEBUG: MOUSE_MOVE] Maus ist AKTIV über der Signalfläche von: {}", program.plot().id);
 
             //  state.is_mouse_inside = true; // <-- HIER AKTIVIEREN!
             state.hover = Some(pos);
@@ -460,16 +473,30 @@ fn handle_mouse_up(
         }
     }
 
-    // --- DOUBLE-CLICK DETECTION FOR RESETVIEW ---
-    // Check if this is a left-click release (not a drag) and detect double-click.
-    let was_click = button == mouse::Button::Left 
-        && drag.as_ref().is_none_or(|d| d.mode != DragMode::ZoomRect);
+    // --- DOUBLE-CLICK DETECTION FOR RESETVIEW (Grab tool only) ---
+    // ResetView is EXCLUSIVE to the Grab (default navigation) tool and only on
+    // a DOUBLE-click over EMPTY plot space. Every other tool, every single
+    // click and any click on data must never reset the view.
+    let is_grab = program.current_tool() == Tool::Grab;
+    let was_click = button == mouse::Button::Left
+        && drag.as_ref().is_none_or(|d| d.mode != DragMode::ZoomRect)
+        && is_grab;
 
     if was_click {
         if let Some(pos) = position {
+            // Does this click land on a data target (series point / pin / region)?
+            // Double-click on empty space resets the view; double-click ON data
+            // only toggles the pin (no ResetView) — matching DAW conventions.
+            let on_data = state
+                .hover_target
+                .as_ref()
+                .is_some_and(|t| {
+                    super::hover::hover_target_within_threshold(t, pos, program.config())
+                })
+                || plot_event_under_cursor(program, state, pos);
             // Check if this is a double-click with the previously stored click
             if let Some(last_click) = state.last_click {
-                if is_double_click(&last_click, pos, button) {
+                if is_double_click(&last_click, pos, button) && !on_data {
                     // Double-click detected: UNDO the pin from the first click, then emit ResetView
                     if let Some(pin_toggle) = state.last_pin_toggle.take() {
                         program.with_plot_mut(|plot| {
@@ -564,6 +591,28 @@ fn execute_pin_and_store(
     });
 }
 
+/// True when the cursor is over a region (MIDI note, clip, marker, ...).
+/// Used to suppress ResetView on double-click over data.
+fn plot_event_under_cursor(
+    program: &Program,
+    state: &PlotUiState,
+    pos: crate::geom::ScreenPoint,
+) -> bool {
+    let Some(transform) = state.transform.clone() else {
+        return false;
+    };
+    let Some(data) = transform.screen_to_data(pos) else {
+        return false;
+    };
+    let Some(plot_rect) = state.plot_rect else {
+        return false;
+    };
+    if !super::geometry::rect_contains(plot_rect, pos) {
+        return false;
+    }
+    region_at(program, &transform, data).is_some()
+}
+
 /// Phase of a tool mouse interaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolPhase {
@@ -635,6 +684,17 @@ pub(crate) fn run_tool_mouse(
                     ) {
                         let (x0, x1) = if p0.x <= p1.x { (p0.x, p1.x) } else { (p1.x, p0.x) };
                         let (y0, y1) = if p0.y <= p1.y { (p0.y, p1.y) } else { (p1.y, p0.y) };
+                        // The host marks regions selected; mirror that list into
+                        // the tool state so group edits apply to all of them.
+                        program.with_tool_state(|ts| {
+                            ts.selected_regions = program
+                                .plot()
+                                .regions()
+                                .iter()
+                                .filter(|r| r.selected)
+                                .map(|r| r.id)
+                                .collect();
+                        });
                         program.emit_tool_event(ToolEvent::BoxSelect { x0, x1, y0, y1 });
                     }
                 }
@@ -644,13 +704,61 @@ pub(crate) fn run_tool_mouse(
         return;
     }
 
-    // ---- MOVE tool: press on a region, drag it, release commits MoveRegion ----
+    // ---- MOVE tool: press on a region, drag it, release commits MoveRegion.
+    // Grabbing within 6px of a region's start/end edge (the always-visible
+    // rectangles) switches the gesture into an edge resize instead.
+    // Pressing on empty space while a box-selection exists drags the WHOLE
+    // selection (dt from the press point).
     if tool == Tool::Move {
         match phase {
             ToolPhase::Down => {
                 let region = region_at(program, &transform, snapped_point);
+                // Nothing under the cursor but regions are selected? Grab the
+                // EARLIEST selected region and anchor the gesture at THAT
+                // region's start (not at the click point), so the group slides
+                // under the cursor instead of jumping by the click offset.
+                let (region, anchor_x) = match &region {
+                    Some(r) => {
+                        let anchor = r.time_range().map(|t| t.min).unwrap_or(snapped_point.x);
+                        (Some(r.clone()), anchor)
+                    }
+                    None => {
+                        let selected = selected_regions(program);
+                        let picked = program
+                            .plot()
+                            .regions()
+                            .iter()
+                            .filter(|r| selected.contains(&r.id))
+                            .min_by(|a, b| {
+                                a.time_range()
+                                    .map(|t| t.min)
+                                    .partial_cmp(&b.time_range().map(|t| t.min))
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            })
+                            .cloned();
+                        if let Some(r) = picked.as_ref() {
+                            let anchor = r.time_range().map(|t| t.min).unwrap_or(snapped_point.x);
+                            (picked, anchor)
+                        } else {
+                            (None, snapped_point.x)
+                        }
+                    }
+                };
+                // Edge detection: convert 6 px to data units
+                let px6_data = 6.0 * (transform.data_span_x() / f64::from(transform.screen().width().max(1.0)));
+                let edge = region.as_ref().and_then(|r| {
+                    let tr = r.time_range()?;
+                    if (snapped_point.x - tr.min).abs() <= px6_data {
+                        Some(ResizeEdge::Start)
+                    } else if (tr.max - snapped_point.x).abs() <= px6_data {
+                        Some(ResizeEdge::End)
+                    } else {
+                        None
+                    }
+                });
                 program.with_tool_state(|ts| {
-                    ts.move_gesture = region.map(|r| (r.id, snapped_point.x, snapped_point.y));
+                    ts.move_gesture = region.map(|r| (r.id, anchor_x, snapped_point.y));
+                    ts.move_edge = edge;
                     ts.gesture = ToolGesture::Drag {
                         start: snapped_point,
                         start_screen: screen,
@@ -660,17 +768,48 @@ pub(crate) fn run_tool_mouse(
                 });
             }
             ToolPhase::Up => {
-                let held = program.with_tool_state(|ts| ts.move_gesture.take());
-                program.with_tool_state(|ts| ts.gesture = ToolGesture::None);
+                let (held, edge) = program.with_tool_state(|ts| {
+                    let held = ts.move_gesture.take();
+                    let edge = ts.move_edge.take();
+                    ts.gesture = ToolGesture::None;
+                    (held, edge)
+                });
+                let selected_ids = selected_regions(program);
                 if let (Some((id, grab_x, grab_y)), Some(transform)) = (held, state.transform.clone()) {
                     if let Some(end) = transform.screen_to_data(screen) {
-                        let _ = grab_x;
+                        // Edge grab → resize instead of move
+                        if let Some(edge) = edge {
+                            let mut targets: Vec<crate::region::RegionId> = vec![id];
+                            for sid in &selected_ids {
+                                if *sid != id {
+                                    targets.push(*sid);
+                                }
+                            }
+                            for target in targets {
+                                program.emit_tool_event(ToolEvent::ResizeRegion {
+                                    region: target,
+                                    edge,
+                                    time: end.x,
+                                });
+                            }
+                            return;
+                        }
                         let dy = (end.y - grab_y).round().clamp(-64.0, 64.0) as i64;
-                        program.emit_tool_event(ToolEvent::MoveRegion {
-                            region: id,
-                            dt: end.x - grab_x,
-                            dy: dy as u8,
-                        });
+                        // Group edit: emit for the grabbed region AND all
+                        // regions selected by box-select.
+                        let mut targets: Vec<crate::region::RegionId> = vec![id];
+                        for sid in &selected_ids {
+                            if *sid != id {
+                                targets.push(*sid);
+                            }
+                        }
+                        for target in targets {
+                            program.emit_tool_event(ToolEvent::MoveRegion {
+                                region: target,
+                                dt: end.x - grab_x,
+                                dy: dy as i8,
+                            });
+                        }
                     }
                 }
             }
@@ -679,8 +818,8 @@ pub(crate) fn run_tool_mouse(
         return;
     }
 
-    // ---- RESIZE: Move tool variant handled above; dedicated handles use
-    // Scale/Stretch as edge-drag (Scale = start edge, Stretch = end edge) ----
+    // ---- RESIZE: dedicated edge-drag (Scale = start edge, Stretch = end edge).
+    // Applies to the grabbed region and all box-selected regions (group edit).
     if tool == Tool::Scale || tool == Tool::Stretch {
         let edge = if tool == Tool::Scale { ResizeEdge::Start } else { ResizeEdge::End };
         match phase {
@@ -697,15 +836,27 @@ pub(crate) fn run_tool_mouse(
                 });
             }
             ToolPhase::Up => {
-                let held = program.with_tool_state(|ts| ts.move_gesture.take());
-                program.with_tool_state(|ts| ts.gesture = ToolGesture::None);
+                let held = program.with_tool_state(|ts| {
+                    let held = ts.move_gesture.take();
+                    ts.gesture = ToolGesture::None;
+                    held
+                });
+                let selected_ids = selected_regions(program);
                 if let (Some((id, _, _)), Some(transform)) = (held, state.transform.clone()) {
                     if let Some(end) = transform.screen_to_data(screen) {
-                        program.emit_tool_event(ToolEvent::ResizeRegion {
-                            region: id,
-                            edge,
-                            time: end.x,
-                        });
+                        let mut targets: Vec<crate::region::RegionId> = vec![id];
+                        for sid in &selected_ids {
+                            if *sid != id {
+                                targets.push(*sid);
+                            }
+                        }
+                        for target in targets {
+                            program.emit_tool_event(ToolEvent::ResizeRegion {
+                                region: target,
+                                edge,
+                                time: end.x,
+                            });
+                        }
                     }
                 }
             }
@@ -831,6 +982,13 @@ fn emit_domain_pen(program: &Program, position: crate::geom::Point) {
 }
 
 /// Find the region under the cursor (topmost, unlocked, visible).
+/// Topmost visible region under the cursor.
+///
+/// Uses the full 2D hit test (`DataRegion::contains`) so a MIDI note is only
+/// hit inside its pitch row — clicking empty vertical space next to a note no
+/// longer selects it (which previously broke Move/Eraser on empty space).
+/// Full-height regions (loop, markers, full-lane audio) only bind their X
+/// span, so a small X tolerance is added for hairline/marker regions.
 fn region_at(
     program: &Program,
     transform: &crate::transform::Transform,
@@ -842,11 +1000,33 @@ fn region_at(
         .iter()
         .filter(|r| r.visible && !r.locked)
         .filter(|r| {
-            r.time_range()
-                .is_some_and(|t| pos_data.x >= t.min && pos_data.x <= t.max)
+            let hit = r.contains(pos_data.x, pos_data.y);
+            // Fallback for full-column regions whose value_range() is None:
+            // allow the X span to match regardless of Y.
+            if !hit && r.value_range().is_none() {
+                r.contains(pos_data.x, pos_data.y)
+                    || r.time_range()
+                        .is_some_and(|t| pos_data.x >= t.min && pos_data.x <= t.max)
+            } else {
+                hit
+            }
         })
         .max_by_key(|r| r.z_index)
         .cloned()
+}
+
+/// Region ids currently flagged `selected` in the plot (box-select result).
+///
+/// Reading the flag from the model (instead of tool state) keeps group edits
+/// alive across program rebuilds / track switches.
+fn selected_regions(program: &Program) -> Vec<crate::region::RegionId> {
+    program
+        .plot()
+        .regions()
+        .iter()
+        .filter(|r| r.selected)
+        .map(|r| r.id)
+        .collect()
 }
 
 /// Erase the region under the cursor with a single click.

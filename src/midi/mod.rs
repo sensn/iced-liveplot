@@ -420,6 +420,48 @@ impl MidiSequence {
         let ticks = self.total_duration_ticks();
         MidiNote::tick_to_seconds_static(ticks, self.ticks_per_beat, self.tempo)
     }
+
+    /// Number of notes in a track (0 when out of range).
+    pub fn note_count(&self, track: usize) -> usize {
+        self.tracks.get(track).map(|t| t.notes.len()).unwrap_or(0)
+    }
+
+    /// Remove the note at `track[index]`, returning it.
+    pub fn remove_note(&mut self, track: usize, index: usize) -> Option<MidiNote> {
+        self.tracks.get_mut(track).and_then(|t| {
+            if index < t.notes.len() {
+                Some(t.notes.remove(index))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Paste `notes` into `track`, shifted so they start at the track's
+    /// earliest gap (or keep their start when `offset_ticks` is 0). Notes are
+    /// re-sorted and assigned to the track's own channel.
+    pub fn paste_notes(&mut self, track: usize, notes: &[MidiNote], offset_ticks: u64) {
+        let Some(track_ref) = self.tracks.get_mut(track) else { return };
+        let channel = track_ref.channel;
+        for mut note in notes.iter().cloned() {
+            note.start_tick += offset_ticks;
+            note.end_tick += offset_ticks;
+            note.channel = channel;
+            track_ref.add_note(note);
+        }
+    }
+
+    /// Delete every note of the sequence (all tracks).
+    pub fn clear_all(&mut self) {
+        for track in &mut self.tracks {
+            track.notes.clear();
+        }
+    }
+
+    /// Ticks per quarter note (alias of `ticks_per_beat`).
+    pub fn ppq(&self) -> u64 {
+        self.ticks_per_beat
+    }
 }
 
 impl MidiNote {

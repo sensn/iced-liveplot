@@ -27,3 +27,7 @@ path = "src/bin/advanced.rs"
 [[bin]]
 name = "advanced_future_directions"
 path = "src/bin/advanced_future_directions.rs"
+
+[[bin]]
+name = "midi_sequencer"
+path = "src/bin/midi_sequencer.rs"

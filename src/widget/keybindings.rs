@@ -234,16 +234,15 @@ mod tests {
         assert_eq!(kb.lookup(Key::Character("y".into()), Modifiers::CTRL), Some(StandardAction::Redo));
         assert_eq!(kb.lookup(Key::Character("c".into()), Modifiers::CTRL), Some(StandardAction::Copy));
         assert_eq!(kb.lookup(Key::Character("v".into()), Modifiers::CTRL), Some(StandardAction::Paste));
-        assert_eq!(kb.lookup(Key::Delete, Modifiers::empty()), Some(StandardAction::Delete));
+        assert_eq!(kb.lookup(Key::Named(iced::keyboard::key::Named::Delete), Modifiers::empty()), Some(StandardAction::Delete));
     }
     
     #[test]
     fn test_custom_binding() {
         let mut kb = KeyBindings::new();
-        kb.bind(Key::KeyQ, Modifiers::CTRL, StandardAction::Quit);
         
         // Note: Quit isn't in StandardAction, this is just testing the mechanism
-        kb.bind(Key::KeyQ, Modifiers::CTRL, StandardAction::Undo);
-        assert_eq!(kb.lookup(Key::KeyQ, Modifiers::CTRL), Some(StandardAction::Undo));
+        kb.bind(Key::Character("q".into()), Modifiers::CTRL, StandardAction::Undo);
+        assert_eq!(kb.lookup(Key::Character("q".into()), Modifiers::CTRL), Some(StandardAction::Undo));
     }
 }

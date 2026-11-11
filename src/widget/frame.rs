@@ -44,6 +44,7 @@ pub(crate) struct PlotFrame {
 }
 
 pub(crate) fn build_frame(
+    program: &crate::widget::Program,
     plot: &mut Plot,
     state: &mut PlotUiState,
     config: &PlotViewConfig,
@@ -142,6 +143,7 @@ pub(crate) fn build_frame(
         );
         build_series(&mut render, plot, state, &transform, plot_rect);
         build_linked_brush(&mut render, plot, state, &transform, plot_rect);
+        build_playhead(&mut render, program, state, &transform, plot_rect);
         build_selection(&mut render, plot, state);
         build_regions(&mut render, plot, &transform, plot_rect, &measurer);
         update_hover_target(
@@ -378,15 +380,69 @@ fn build_series(
     render.push(RenderCommand::ClipEnd);
 }
 
+/// Draw the transport playhead: a bright vertical line with a triangle flag
+/// at the top of the plot. Hidden when the playhead is at position 0 and the
+/// transport has never been started.
+fn build_playhead(
+    render: &mut RenderList,
+    program: &crate::widget::Program,
+    state: &PlotUiState,
+    transform: &Transform,
+    plot_rect: ScreenRect,
+) {
+    let _ = state;
+    let tick = program.playhead_ticks();
+    if tick == 0 {
+        return;
+    }
+    let tpb = program.ticks_per_beat().max(1) as f64;
+    let seconds = tick as f64 / (tpb * 2.0);
+    let Some(point) = transform.data_to_screen(crate::geom::Point::new(seconds, 0.0)) else {
+        return;
+    };
+    let x = point.x;
+    if x < plot_rect.min.x || x > plot_rect.max.x {
+        return;
+    }
+    // Vertical line
+    render.push(RenderCommand::Rect {
+        rect: ScreenRect::new(
+            ScreenPoint::new(x - 1.0, plot_rect.min.y),
+            ScreenPoint::new(x + 1.0, plot_rect.max.y),
+        ),
+        style: RectStyle {
+            fill: Color::from_rgba(1.0, 1.0, 1.0, 0.9),
+            stroke: Color::from_rgba(0.0, 0.0, 0.0, 0.4),
+            stroke_width: 0.5,
+            dashed: false,
+        },
+    });
+    // Triangle flag at the top
+    let mut builder = iced::widget::canvas::path::Builder::new();
+    builder.move_to(iced::Point::new(x - 5.0, plot_rect.min.y - 8.0));
+    builder.line_to(iced::Point::new(x + 5.0, plot_rect.min.y - 8.0));
+    builder.line_to(iced::Point::new(x, plot_rect.min.y));
+    builder.close();
+    let flag = builder.build();
+    render.push(RenderCommand::Path {
+        path: flag,
+        fill: Some(Color::from_rgba(1.0, 1.0, 1.0, 0.9)),
+        stroke: Some(Color::from_rgba(0.0, 0.0, 0.0, 0.5)),
+        stroke_width: 1.0,
+    });
+}
+
 fn build_selection(render: &mut RenderList, plot: &Plot, state: &PlotUiState) {
     if let Some(rect) = state.selection_rect {
         let rect = normalized_rect(rect);
         render.push(RenderCommand::Rect {
             rect,
             style: RectStyle {
-                fill: plot.theme().selection_fill,
+                // Marching-ants dotted outline for the box-select rubber band
                 stroke: plot.theme().selection_border,
-                stroke_width: 1.0,
+                stroke_width: 1.5,
+                fill: plot.theme().selection_fill,
+                dashed: true,
             },
         });
     }
@@ -700,6 +756,7 @@ fn draw_region_body(
                         fill: fill_color,
                         stroke: stroke_color,
                         stroke_width,
+                        dashed: false,
                     },
                 });
                 
@@ -715,6 +772,7 @@ fn draw_region_body(
                         fill: Color::WHITE,
                         stroke: Color::TRANSPARENT,
                         stroke_width: 0.0,
+                        dashed: false,
                     },
                 });
                 
@@ -749,6 +807,7 @@ fn draw_region_body(
                             fill: chan_color.to_iced(),
                             stroke: Color::TRANSPARENT,
                             stroke_width: 0.0,
+                            dashed: false,
                         },
                     });
                 }
@@ -761,6 +820,7 @@ fn draw_region_body(
                         fill: fill_color,
                         stroke: stroke_color,
                         stroke_width,
+                        dashed: false,
                     },
                 });
                 
@@ -778,6 +838,7 @@ fn draw_region_body(
                             fill: Color::from_rgba(1.0, 1.0, 1.0, 0.2),
                             stroke: Color::TRANSPARENT,
                             stroke_width: 0.0,
+                            dashed: false,
                         },
                     });
                 }
@@ -793,6 +854,7 @@ fn draw_region_body(
                             fill: Color::from_rgba(1.0, 1.0, 1.0, 0.2),
                             stroke: Color::TRANSPARENT,
                             stroke_width: 0.0,
+                            dashed: false,
                         },
                     });
                 }
@@ -837,6 +899,7 @@ fn draw_region_body(
                         fill: marker_color,
                         stroke: Color::TRANSPARENT,
                         stroke_width: 0.0,
+                        dashed: false,
                     },
                 });
 
@@ -873,6 +936,7 @@ fn draw_region_body(
                         fill: fill_color,
                         stroke: stroke_color,
                         stroke_width: 2.0,
+                        dashed: false,
                     },
                 });
                 
@@ -892,6 +956,7 @@ fn draw_region_body(
                         fill: stroke_color,
                         stroke: Color::TRANSPARENT,
                         stroke_width: 0.0,
+                        dashed: false,
                     },
                 });
                 render.push(RenderCommand::Rect {
@@ -900,6 +965,7 @@ fn draw_region_body(
                         fill: stroke_color,
                         stroke: Color::TRANSPARENT,
                         stroke_width: 0.0,
+                        dashed: false,
                     },
                 });
             }
@@ -911,6 +977,7 @@ fn draw_region_body(
                         fill: fill_color,
                         stroke: stroke_color,
                         stroke_width,
+                        dashed: false,
                     },
                 });
             }
@@ -924,10 +991,16 @@ fn draw_region_body(
                 | crate::region::RegionKind::AudioRegion { .. }
                 | crate::region::RegionKind::Loop { .. }
         );
-        if has_edges && region.selected {
+        if has_edges {
+            // Always visible so users can discover Scale/Stretch dragging;
+            // highlighted when the region is selected.
             let handle_w = 4.0;
             let handle_h = clipped_bounds.height().min(14.0).max(8.0);
-            let handle_color = SerializableColor::new(1.0, 0.9, 0.4, 1.0).to_iced();
+            let handle_color = if region.selected {
+                SerializableColor::new(1.0, 0.9, 0.4, 1.0) // bright yellow when selected
+            } else {
+                SerializableColor::new(1.0, 1.0, 1.0, 0.55) // translucent white
+            }.to_iced();
             // Start handle
             let start_handle = ScreenRect::new(
                 ScreenPoint::new(clipped_bounds.min.x - 1.0, (clipped_bounds.min.y + clipped_bounds.max.y) / 2.0 - handle_h / 2.0),
@@ -939,6 +1012,7 @@ fn draw_region_body(
                     fill: handle_color,
                     stroke: Color::BLACK,
                     stroke_width: 1.0,
+                    dashed: false,
                 },
             });
             // End handle
@@ -952,6 +1026,7 @@ fn draw_region_body(
                     fill: handle_color,
                     stroke: Color::BLACK,
                     stroke_width: 1.0,
+                    dashed: false,
                 },
             });
         }
@@ -968,6 +1043,7 @@ fn draw_region_body(
                     fill: Color::TRANSPARENT,
                     stroke: SerializableColor::new(1.0, 0.8, 0.2, 1.0).to_iced(),
                     stroke_width: 2.0,
+                    dashed: false,
                 },
             });
             
@@ -997,6 +1073,7 @@ fn draw_region_body(
                         fill: Color::WHITE,
                         stroke: SerializableColor::new(1.0, 0.6, 0.0, 1.0).to_iced(),
                         stroke_width: 1.5,
+                        dashed: false,
                     },
                 });
             }
@@ -1094,6 +1171,7 @@ fn build_axes(
                 },
                 stroke: theme.axis,
                 stroke_width: 1.0,
+                dashed: false,
             },
         });
     }
@@ -1491,6 +1569,7 @@ fn build_hover(
                 fill: theme.pin_bg,
                 stroke: theme.pin_border,
                 stroke_width: 1.0,
+                dashed: false,
             },
         });
 
@@ -1538,6 +1617,7 @@ fn build_hover(
             fill: theme.hover_bg,
             stroke: theme.hover_border,
             stroke_width: 1.0,
+            dashed: false,
         },
     });
 
@@ -1726,6 +1806,7 @@ fn build_linked_cursor(
             fill: with_alpha(theme.hover_bg, 0.9),
             stroke: with_alpha(theme.hover_border, 0.9),
             stroke_width: 1.0,
+            dashed: false,
         },
     });
 
@@ -1791,6 +1872,7 @@ fn build_linked_brush(
             fill: with_alpha(theme.selection_fill, super::constants::LINK_BRUSH_FILL_ALPHA),
             stroke: with_alpha(theme.selection_border, super::constants::LINK_BRUSH_BORDER_ALPHA),
             stroke_width: 1.0,
+            dashed: false,
         },
     });
     render.push(RenderCommand::ClipEnd);
@@ -1842,6 +1924,7 @@ fn build_legend(
             fill: theme.legend_bg,
             stroke: theme.legend_border,
             stroke_width: 1.0,
+            dashed: false,
         },
     });
 
@@ -2068,6 +2151,7 @@ fn push_label_with_leader(
             fill: theme.pin_bg,
             stroke: theme.pin_border,
             stroke_width: 1.0,
+            dashed: false,
         },
     });
     for (index, line) in label.lines().enumerate() {

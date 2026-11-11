@@ -81,6 +81,9 @@ pub struct RectStyle {
     pub stroke: Color,
     /// Stroke width.
     pub stroke_width: f32,
+    /// Draw only the border as a dashed outline (dotted marching-ants look
+    /// used by the box-select rectangle). When true, `fill` is ignored.
+    pub dashed: bool,
 }
 
 impl Default for RectStyle {
@@ -99,6 +102,7 @@ impl Default for RectStyle {
                 a: 1.0,
             },
             stroke_width: 1.0,
+            dashed: false,
         }
     }
 }

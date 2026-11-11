@@ -17,7 +17,7 @@
 use iced::Widget;
 use iced_liveplot::{
     Plot, PlotBuilder, Series, SeriesKind, Theme, Viewport,
-    widget::{Program, Message as PlotMessage, PlotViewConfig, KeyBindings, StandardAction, keybindings::Chord, Tool, ToolRegistry, ToolState, ToolEvent},
+    widget::{Program, Message as PlotMessage, PlotViewConfig, KeyBindings, StandardAction, keybindings::Chord, Tool, ToolRegistry, ToolState, ToolEvent, actions::{AddRegions, RemoveRegions, RestoreRegions}},
     geom::Point,
     render::{LineStyle, MarkerStyle, MarkerShape},
     axis::{AxisConfig, AxisFormatter},
@@ -41,7 +41,6 @@ use iced::{
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::collections::HashMap;
 
 // ============================================================================
 // APP STATE
@@ -75,6 +74,9 @@ enum Message {
     // Selection
     SelectAllRegions,
     ClearSelection,
+    CopySelection,
+    CutSelection,
+    Paste,
     // Snap/Grid
     ToggleSnap,
     SetSnapDivision(u32),
@@ -123,8 +125,8 @@ enum ToolLog {
     AutoPoint(f64, f64),
     /// Markers domain pen: drop a marker.
     Marker(f64),
-    /// Move a region by dt (seconds) and dy (semitones).
-    RegionMoved(u64, f64, u8),
+    /// Move a region by dt (seconds) and dy (semitones, signed: negative = down).
+    RegionMoved(u64, f64, i8),
     /// Resize a region edge to a new time.
     RegionResized(u64, bool, f64),
     /// Box select: select all regions intersecting the rect.
@@ -574,7 +576,7 @@ impl AdvancedApp {
         );
         region.series = self.linked_series.midi;
         
-        self.program.with_plot_mut(|plot| plot.add_region(region));
+        self.program.execute_action(std::sync::Arc::new(AddRegions { regions: vec![region] }));
         self.log_action(format!("Added MIDI note: {} (pitch={}, vel={}, time={:.2}s)", 
             midi_note_name(pitch), pitch, velocity, snapped_time));
     }
@@ -593,7 +595,7 @@ impl AdvancedApp {
         let mut data_region = region.to_data_region();
         data_region.series = self.linked_series.audio;
         
-        self.program.with_plot_mut(|plot| plot.add_region(data_region));
+        self.program.execute_action(std::sync::Arc::new(AddRegions { regions: vec![data_region] }));
         self.log_action(format!("Added audio region: Clip {} at {:.1}s ({:.1}s)", 
             self.audio_regions.len(), time, duration));
     }
@@ -609,7 +611,7 @@ impl AdvancedApp {
         );
         region.series = self.linked_series.automation;
         
-        self.program.with_plot_mut(|plot| plot.add_region(region));
+        self.program.execute_action(std::sync::Arc::new(AddRegions { regions: vec![region] }));
         self.log_action(format!("Added automation point: {}={:.2} at {:.1}s ({:?})", 
             parameter, value, time, curve));
     }
@@ -623,7 +625,7 @@ impl AdvancedApp {
         marker.series = self.linked_series.markers;
         
         self.markers.push(marker.clone());
-        self.program.with_plot_mut(|plot| plot.add_region(marker));
+        self.program.execute_action(std::sync::Arc::new(AddRegions { regions: vec![marker] }));
         self.log_action(format!("Added marker: {} at {:.1}s", label, time));
     }
     
@@ -641,6 +643,11 @@ impl AdvancedApp {
     
     fn delete_selected_regions(&mut self) {
         let selected_ids: Vec<_> = self.selection.regions.iter().cloned().collect();
+        // Snapshot for undo BEFORE removing
+        let removed = {
+            let plot = self.program.plot();
+            RemoveRegions::capture(&plot, &selected_ids)
+        };
         for id in selected_ids.iter().copied() {
             self.program.with_plot_mut(|plot| plot.remove_region(id));
             
@@ -664,6 +671,7 @@ impl AdvancedApp {
         let deleted_count = selected_ids.len();
         drop(selected_ids);
         self.selection.regions.clear();
+        self.program.execute_action(std::sync::Arc::new(removed));
         self.log_action(format!("Deleted {} selected regions", deleted_count));
     }
     
@@ -828,15 +836,26 @@ impl AdvancedApp {
         }
     }
     
-    /// Move a region by `dt` seconds and `dy` semitones.
-    fn move_region(&mut self, id: RegionId, dt: f64, dy: u8) {
+    /// Move a region by `dt` seconds and `dy` semitones (signed: negative down).
+    fn move_region(&mut self, id: RegionId, dt: f64, dy: i8) {
+        let semitones = dy as i16;
+        // Capture the pre-move snapshot for undo
+        let before: Vec<_> = self
+            .program
+            .plot()
+            .regions()
+            .iter()
+            .filter(|r| r.id == id || self.selection.regions.contains(&r.id))
+            .cloned()
+            .collect();
         self.program.with_plot_mut(|plot| {
             if let Some(region) = plot.regions_mut().iter_mut().find(|r| r.id == id) {
                 match &mut region.kind {
                     RegionKind::MidiNote { start, end, pitch, .. } => {
                         *start = (*start + dt).max(0.0);
                         *end = (*end + dt).max(0.0);
-                        *pitch = pitch.saturating_add(dy).min(127).max(0);
+                        let new_pitch = *pitch as i16 + semitones;
+                        *pitch = new_pitch.clamp(0, 127) as u8;
                     }
                     RegionKind::AudioRegion { start, .. } => {
                         *start = (*start + dt).max(0.0);
@@ -855,11 +874,20 @@ impl AdvancedApp {
                 }
             }
         });
-        self.log_action(format!("Moved region #{} by {:.2}s (+{} st)", id.0, dt, dy));
+        self.program.execute_action(std::sync::Arc::new(RestoreRegions { before }));
+        self.log_action(format!("Moved region #{} by {:.2}s ({:+} st)", id.0, dt, semitones));
     }
     
     /// Resize a region edge (start or end) to `time`.
     fn resize_region(&mut self, id: RegionId, is_start: bool, time: f64) {
+        let before: Vec<_> = self
+            .program
+            .plot()
+            .regions()
+            .iter()
+            .filter(|r| r.id == id || self.selection.regions.contains(&r.id))
+            .cloned()
+            .collect();
         self.program.with_plot_mut(|plot| {
             if let Some(region) = plot.regions_mut().iter_mut().find(|r| r.id == id) {
                 match &mut region.kind {
@@ -891,26 +919,41 @@ impl AdvancedApp {
                 }
             }
         });
+        self.program.execute_action(std::sync::Arc::new(RestoreRegions { before }));
         self.log_action(format!("Resized region #{} {} to {:.2}s", id.0, if is_start { "start" } else { "end" }, time));
     }
     
-    /// Select all regions intersecting the data-space box.
+    /// Select all regions intersecting (touched by) the data-space box.
+    /// Both X (time) and Y (value) must overlap for span regions; for
+    /// point-like regions (markers, automation) only X matters plus the
+    /// point's Y must lie within the box's Y band.
     fn box_select(&mut self, x0: f64, x1: f64, y0: f64, y1: f64) {
         let (x_min, x_max) = if x0 <= x1 { (x0, x1) } else { (x1, x0) };
         let (y_min, y_max) = if y0 <= y1 { (y0, y1) } else { (y1, y0) };
         let mut count = 0;
         self.program.with_plot_mut(|plot| {
             for region in plot.regions_mut() {
-                let inside = region.time_range().is_some_and(|t| t.max >= x_min && t.min <= x_max);
-                if inside {
+                let Some(t) = region.time_range() else { continue };
+                // X: intervals intersect (touching counts)
+                if t.max < x_min || t.min > x_max {
+                    continue;
+                }
+                // Y: region's value range overlaps the box band
+                let y_hit = match region.value_range() {
+                    Some(v) => v.max >= y_min && v.min <= y_max,
+                    None => true,
+                };
+                if y_hit {
                     region.selected = true;
                     self.selection.regions.insert(region.id);
                     count += 1;
                 }
             }
         });
-        let _ = (y_min, y_max);
-        self.log_action(format!("Box select: {} regions in [{:.1}, {:.1}]", count, x_min, x_max));
+        self.log_action(format!(
+            "Box select: {} regions touched in x[{:.1}, {:.1}] y[{:.1}, {:.1}]",
+            count, x_min, x_max, y_min, y_max
+        ));
     }
     
     // ========================================================================
@@ -974,6 +1017,28 @@ impl AdvancedApp {
             Message::ClearSelection => {
                 self.clear_selection();
             }
+            Message::CopySelection => {
+                let ids: Vec<_> = self.selection.regions.iter().cloned().collect();
+                if !ids.is_empty() {
+                    self.program.execute_action(std::sync::Arc::new(
+                        iced_liveplot::widget::actions::CopyRegions { ids }));
+                    self.log_action("Copied selection to clipboard".into());
+                }
+            }
+            Message::CutSelection => {
+                let ids: Vec<_> = self.selection.regions.iter().cloned().collect();
+                if !ids.is_empty() {
+                    self.program.execute_action(std::sync::Arc::new(
+                        iced_liveplot::widget::actions::CopyRegions { ids }));
+                    self.delete_selected_regions();
+                    self.log_action("Cut selection".into());
+                }
+            }
+            Message::Paste => {
+                self.program.execute_action(std::sync::Arc::new(
+                    iced_liveplot::widget::actions::PasteRegions::new(0.0)));
+                self.log_action("Pasted from clipboard".into());
+            }
             Message::ToggleSnap => {
                 self.snap_enabled = !self.snap_enabled;
                 self.snap_engine.config_mut().enabled = self.snap_enabled;
@@ -1004,10 +1069,7 @@ impl AdvancedApp {
                 self.log_action(format!("Note length: {}", len.label()));
             }
             Message::ToggleTimeAxis => {
-                let next = match self.program.time_axis() {
-                    iced_liveplot::widget::TimeAxisMode::Seconds => iced_liveplot::widget::TimeAxisMode::Ticks,
-                    iced_liveplot::widget::TimeAxisMode::Ticks => iced_liveplot::widget::TimeAxisMode::Seconds,
-                };
+                let next = self.program.time_axis().next();
                 self.program.set_time_axis(next);
                 self.log_action(format!("X axis: {:?}", next));
             }
@@ -1064,6 +1126,28 @@ impl AdvancedApp {
                         StandardAction::SelectAll => self.select_all_regions(),
                         StandardAction::DeselectAll => self.clear_selection(),
                         StandardAction::Delete => self.delete_selected_regions(),
+                        StandardAction::Copy => {
+                            let ids: Vec<_> = self.selection.regions.iter().cloned().collect();
+                            if !ids.is_empty() {
+                                self.program.execute_action(std::sync::Arc::new(
+                                    iced_liveplot::widget::actions::CopyRegions { ids }));
+                                self.log_action("Copied selection to clipboard".into());
+                            }
+                        }
+                        StandardAction::Cut => {
+                            let ids: Vec<_> = self.selection.regions.iter().cloned().collect();
+                            if !ids.is_empty() {
+                                self.program.execute_action(std::sync::Arc::new(
+                                    iced_liveplot::widget::actions::CopyRegions { ids: ids.clone() }));
+                                self.delete_selected_regions();
+                                self.log_action("Cut selection".into());
+                            }
+                        }
+                        StandardAction::Paste => {
+                            self.program.execute_action(std::sync::Arc::new(
+                                iced_liveplot::widget::actions::PasteRegions::new(0.0)));
+                            self.log_action("Pasted from clipboard".into());
+                        }
                         StandardAction::ToolGrab => self.program.set_tool(Tool::Grab),
                         StandardAction::ToolSelect => self.program.set_tool(Tool::Select),
                         StandardAction::ToolPen => self.program.set_tool(Tool::Pen),
@@ -1170,6 +1254,11 @@ impl AdvancedApp {
                     ("Clear Sel", Message::ClearSelection),
                     ("Delete Sel", Message::DeleteSelectedRegions),
                 ]),
+                self.control_row("", vec![
+                    ("Copy", Message::CopySelection),
+                    ("Cut", Message::CutSelection),
+                    ("Paste", Message::Paste),
+                ]),
                 
                 rule::horizontal(2),
                 
@@ -1220,6 +1309,7 @@ impl AdvancedApp {
                     (match self.program.time_axis() {
                         iced_liveplot::widget::TimeAxisMode::Seconds => "X: seconds",
                         iced_liveplot::widget::TimeAxisMode::Ticks => "X: ticks",
+                        iced_liveplot::widget::TimeAxisMode::Bars => "X: bars",
                     }, Message::ToggleTimeAxis),
                 ]),
                 

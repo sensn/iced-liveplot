@@ -135,6 +135,21 @@ fn paint_points(frame: &mut canvas::Frame, points: &[ScreenPoint], style: &Marke
 fn paint_rect(frame: &mut canvas::Frame, rect: &ScreenRect, style: &RectStyle) {
     let (position, size) = rect_to_parts(rect);
     let path = Path::rectangle(position, size);
+    if style.dashed {
+        // Dotted "marching ants" outline used by the box-select rectangle:
+        // transparent fill + dashed stroke.
+        frame.fill(&path, iced::Color::TRANSPARENT);
+        let dash_segments: [f32; 2] = [4.0, 4.0];
+        let mut dash = iced::widget::canvas::Stroke::default()
+            .with_color(style.stroke)
+            .with_width(style.stroke_width);
+        dash.line_dash = iced::widget::canvas::LineDash {
+            segments: &dash_segments,
+            offset: 0,
+        };
+        frame.stroke(&path, dash);
+        return;
+    }
     frame.fill(&path, style.fill);
     frame.stroke(&path, stroke_of(style.stroke, style.stroke_width));
 }
