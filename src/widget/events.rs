@@ -5,7 +5,7 @@
 //! top of the shared interaction helpers (`pan_viewport`, `zoom_viewport`,
 //! `zoom_to_rect`, `toggle_pin`, `zoom_factor_from_drag`).
 // use crate::widget::plot;
-use std::time::Instant;
+//use iced::time::Instant;
 use iced::mouse;
 //use iced::mouse::{Click, click::Kind};
 //use iced::advanced::mouse::Click;
@@ -514,7 +514,7 @@ fn execute_pin_and_store(
             state.last_pin_toggle = Some(super::state::PinToggle {
                 pin: target.pin,
                 added,
-                at: Instant::now(),
+                //at: Instant::now(),
                 screen_pos: pos,
             });
             return;

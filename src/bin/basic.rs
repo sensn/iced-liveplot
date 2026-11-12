@@ -1,10 +1,9 @@
-//! Minimal live plot: a single sine series, dark theme, legend and hover.
+//! Minimal static plot: a single sine series, dark theme, legend and hover.
 //!
 //! Port of `gpui-liveplot/examples/basic.rs` to iced idioms:
-//! `iced::application(update, view)` with a `time::every` subscription for
-//! live redraws.
+//! purely event-driven redraws on user interaction (zero idle CPU/GPU usage).
 
-use iced::{Subscription, Task, Widget};
+use iced::{Task, Widget};
 
 use iced_liveplot::axis::AxisConfig;
 use iced_liveplot::render::LineStyle;
@@ -14,9 +13,11 @@ use iced_liveplot::widget::{self, Message as PlotMessage, Program};
 use iced_liveplot::Plot;
 
 fn main() -> iced::Result {
+    #[cfg(target_arch = "wasm32")]
+    console_error_panic_hook::set_once();
+
     iced::application(App::new, App::update, App::view)
         .title("basic — iced-liveplot")
-        .subscription(App::subscription)
         .window_size(iced::Size {
             width: 720.0,
             height: 480.0,
@@ -26,8 +27,6 @@ fn main() -> iced::Result {
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    /// Live-data tick from the subscription.
-    Tick,
     /// A message from the plot widget (interaction or toggle).
     Plot(PlotMessage),
 }
@@ -56,7 +55,7 @@ impl App {
         );
 
         let mut plot = Plot::builder()
-              .id("top_plot")
+            .id("top_plot")
             .theme(Theme::dark())
             .x_axis(AxisConfig::builder().title("Sample").build())
             .y_axis(AxisConfig::builder().title("Amplitude").build())
@@ -73,31 +72,22 @@ impl App {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            // Live data: refresh the plot viewport and repaint.
-            Message::Tick => {
+            Message::Plot(widget::Message::ResetView) => {
+                self.program.with_plot_mut(|plot| {
+                    plot.reset_view();
+                });
                 self.program.request_redraw();
                 Task::none()
             }
-             Message::Plot(widget::Message::ResetView)  => {
-                                            self.program.with_plot_mut(|plot| { plot.reset_view(); });
-                        //self.program.reset_view(); 
-                        Task::none()
-                       // plot.pins_mut().clear(); // HIER ERGÄNZEN: Löscht den Geister-Pin des ersten Klicks!
-                    }
-            // The widget already handled the interaction; a repaint was
-            // requested via `request_redraw`.
+            // The widget already requested a repaint for hover, pan, zoom, and pins.
             Message::Plot(_) => Task::none(),
-        }    
+        }
     }
 
-   fn view(&self) -> impl Widget<Message> + use<'_> {
-    widget::plot(&self.program)
-        .width(iced::Length::Fill)  // Macht das Widget so breit wie das Fenster
-        .height(iced::Length::Fill) // Macht das Widget so hoch wie das Fenster
-        .map(Message::Plot)
-}
-
-    fn subscription(&self) -> Subscription<Message> {
-        iced::time::every(iced::time::milliseconds(250)).map(|_| Message::Tick)
+    fn view(&self) -> impl Widget<Message> + use<'_> {
+        widget::plot(&self.program)
+            .width(iced::Length::Fill)
+            .height(iced::Length::Fill)
+            .map(Message::Plot)
     }
 }

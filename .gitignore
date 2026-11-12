@@ -13,3 +13,4 @@
 
 # Crash logs from the compiler
 rustc-ice-*.txt
+/dist

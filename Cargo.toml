@@ -6,10 +6,12 @@ publish = false
 description = "Live plotting library for iced (ported from gpui-liveplot)"
 
 [dependencies]
-#iced = { path = "../iced", features = ["canvas", "tokio" ,"advanced"] } # for local dev 
-iced = { git = "https://github.com/iced-rs/iced", branch = "master", features = ["canvas", "tokio", "advanced"] }
-#iced = { git = "https://github.com/iced-rs/iced", rev = "cd04b74ca", features = ["canvas", "tokio", "advanced"] } # dev version
+#iced = { path = "../iced", features = ["canvas","advanced"] } # for local dev  - removed , "tokio" 
+iced = { git = "https://github.com/iced-rs/iced", branch = "master", features = ["canvas",  "advanced", "fira-sans"] }
+#iced = { git = "https://github.com/iced-rs/iced", rev = "cd04b74ca", features = ["canvas", "advanced"] } # dev version
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook = "0.1"
 
 [[bin]]
 name = "basic"

@@ -25,6 +25,9 @@ use iced_liveplot::widget::link::{PlotLinkGroup, PlotLinkOptions}; // KEIN LinkB
 
 
 fn main() -> iced::Result {
+ #[cfg(target_arch = "wasm32")]
+    console_error_panic_hook::set_once();
+
     iced::application(App::new, App::update, App::view)
         .title("advanced — iced-liveplot")
         .subscription(App::subscription)
@@ -277,12 +280,13 @@ fn view(&self) -> impl Widget<Message> + use<'_> {
     })
 }
 
-
-
-
-
-
+fn subscription(&self) -> Subscription<Message> {
+    iced::window::frames().map(|_| Message::Tick)
+}
+}
+/*
     fn subscription(&self) -> Subscription<Message> {
-        iced::time::every(iced::time::milliseconds(16)).map(|_| Message::Tick)
+        iced::time::every(iced::time::milliseconds(250)).map(|_| Message::Tick)
     }
 }
+*/
