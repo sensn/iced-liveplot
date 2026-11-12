@@ -205,7 +205,7 @@ impl Plot {
                 let y = y.with_min_span(1e-9);
                 Some(Viewport::new(x, y))
             }
-            (None, None) => self.viewport, // keep last known good view
+            (None, None) => None, //self.viewport, //caused scroll on empty plot // keep last known good view
             (Some(x), None) => Some(Viewport::new(x.with_min_span(1e-9), Range::new(-1.0, 1.0))),
             (None, Some(y)) => Some(Viewport::new(Range::new(0.0, 1.0), y.with_min_span(1e-9))),
         }

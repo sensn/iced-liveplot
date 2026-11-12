@@ -395,8 +395,9 @@ fn build_playhead(
     if tick == 0 {
         return;
     }
-    let tpb = program.ticks_per_beat().max(1) as f64;
-    let seconds = tick as f64 / (tpb * 2.0);
+    // Use the SAME tempo-aware scale as the playhead scrub (X-axis click) and
+    // the tools — otherwise the drawn playhead drifts from where it is set.
+    let seconds = tick as f64 / program.ticks_per_second();
     let Some(point) = transform.data_to_screen(crate::geom::Point::new(seconds, 0.0)) else {
         return;
     };

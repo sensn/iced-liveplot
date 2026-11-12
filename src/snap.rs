@@ -226,6 +226,8 @@ pub enum SnapType {
 #[derive(Clone)]
 pub struct SnapEngine {
     config: SnapConfig,
+    /// Tempo the grid is expressed in (kept in sync by the host).
+    config_bpm: f64,
     /// Cached grid lines for current view
     cached_grid: Vec<f64>,
     cached_range: Option<crate::region::Range>,
@@ -242,9 +244,18 @@ impl SnapEngine {
             return None;
         }
         let grid = self.config.grid.as_ref()?;
-        let beat = 60.0 / 120.0; // default tempo; tempo-aware snapping uses snap()
-        let _ = beat;
-        Some(grid.snap_time(seconds, 120.0))
+        Some(grid.snap_time(seconds, self.config_bpm))
+    }
+
+    /// Set the tempo used for time-base conversions inside the engine.
+    pub fn set_bpm(&mut self, bpm: f64) {
+        self.config_bpm = bpm.clamp(1.0, 1000.0);
+        self.cached_bpm = self.config_bpm;
+    }
+
+    /// The tempo the grid is expressed in.
+    pub fn bpm(&self) -> f64 {
+        self.config_bpm
     }
 
     pub fn new(config: SnapConfig) -> Self {
@@ -253,6 +264,7 @@ impl SnapEngine {
             cached_grid: Vec::new(),
             cached_range: None,
             cached_bpm: 120.0,
+            config_bpm: 120.0,
         }
     }
     

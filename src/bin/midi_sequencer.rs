@@ -457,23 +457,21 @@ impl SequencerApp {
             return;
         }
         let clip_start = self.clipboard.iter().map(|n| n.start_tick).min().unwrap_or(0);
-        // Snap the target position when snapping is enabled: with snap OFF the
-        // notes land at the EXACT playhead position; with snap ON they land on
-        // the nearest grid line.
-        // The playhead lives in TICKS in the widget; converting through
-        // seconds with the CURRENT tempo keeps both representations identical
-        // (a hard-coded tempo would shift the paste whenever the tempo changes).
+        // Work purely in TICKS. The playhead is a tick value; converting it to
+        // seconds, snapping there and converting back introduces rounding and
+        // tempo drift — the classic "sometimes a bit off" paste bug.
         let playhead = if self.snap_enabled {
-            let target_secs = self.program.playhead_seconds();
-            let snapped = self.snap_engine.snap_position_seconds(target_secs);
-            snapped
-                .map(|s| sec_to_ticks(s, self.tempo))
-                .unwrap_or_else(|| self.program.playhead_ticks())
+            let target = self.program.playhead_ticks() as i64;
+            // Snap in tick space using the configured division (per bar).
+            // division 4 = quarter, 8 = eighth, 16 = sixteenth, 32 = 32nd.
+            let tpb = PPQ as i64;
+            let step = tpb * 4 / self.snap_division.max(1) as i64;
+            step * ((target + step / 2) / step) // round to nearest grid line
         } else {
-            // Snap off: the exact playhead tick (no rounding through seconds).
-            self.program.playhead_ticks()
+            // Snap off: the exact playhead tick.
+            self.program.playhead_ticks() as i64
         };
-        let offset = playhead.saturating_sub(clip_start);
+        let offset = (playhead - clip_start as i64).max(0) as u64;
         let shifted: Vec<MidiNote> = self
             .clipboard
             .iter()
