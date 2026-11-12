@@ -7,8 +7,14 @@
 // use crate::widget::plot;
 use std::time::Instant;
 use iced::mouse;
+//use iced::mouse::{Click, click::Kind};
+//use iced::advanced::mouse::Click;
+use iced::advanced::mouse::{Click, click::Kind};
+
+
 use iced::widget::canvas::{self, Action, Event};
-use iced::{Point, Rectangle};
+//use iced::{Point, Rectangle};
+use iced::Rectangle;
 
 use crate::geom::{ScreenPoint, ScreenRect};
 use crate::interaction::{
@@ -17,23 +23,13 @@ use crate::interaction::{
 use crate::view::Viewport;
 
 use super::hover::update_hover_target;
-use super::state::{ClickState, DragMode, DragState, LastClick, PlotUiState};
+use super::state::{ClickState, DragMode, DragState, PlotUiState};
 use super::{Message, Program};
 
 /// Scroll wheel line height in pixels (matches the GPUI backend default).
 const SCROLL_LINE_HEIGHT: f32 = 16.0;
 /// Drag distance (px) under which a release counts as a click.
 const DRAG_THRESHOLD_PX: f32 = 3.0;
-/// Maximum distance (px) between clicks for a double-click.
-const DOUBLE_CLICK_THRESHOLD_PX: f32 = 6.0;
-/// Maximum time (ms) between clicks for a double-click.
-const DOUBLE_CLICK_THRESHOLD_MS: u128 = 300;
-
-/// Check if a new click forms a double-click with the last click
-fn is_double_click(last: &LastClick, pos: ScreenPoint, button: mouse::Button) -> bool {
-    let now = Instant::now();
-    last.is_double_click(pos, button, now)
-}
 
 /// Handle a canvas event for the plot widget.
 ///
@@ -57,8 +53,7 @@ pub(super) fn handle(
             let Some(pos) = position else {
                 return None;
             };
-            handle_mouse_down(program, state, *button, pos);
-            Some(Action::request_redraw())
+            handle_mouse_down(program, state, *button, pos)
         }
         Event::Mouse(mouse::Event::CursorMoved { .. }) => {
             handle_mouse_move(program, state, position);
@@ -68,6 +63,9 @@ pub(super) fn handle(
             handle_mouse_up(program, state, *button, position)
         }
         Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
+            // Scrollen beendet jede laufende Klick-Sequenz
+            state.last_click = None;
+            state.last_pin_toggle = None;
             handle_scroll(program, state, position, delta);
             Some(Action::request_redraw())
         }
@@ -162,9 +160,11 @@ fn handle_mouse_down(
     state: &mut PlotUiState,
     button: mouse::Button,
     pos: ScreenPoint,
-) {
+) -> Option<canvas::Action<Message>> {
     // Legend entries toggle the visibility of their series.
     if let Some(series_id) = state.legend_hit(pos) {
+        state.last_click = None;
+        state.last_pin_toggle = None;
         program.with_plot_mut(|plot| {
             if let Some(series) = plot
                 .series_mut()
@@ -174,10 +174,44 @@ fn handle_mouse_down(
                 series.set_visible(!series.is_visible());
             }
         });
-        return;
+        return Some(Action::request_redraw());
     }
 
     let region = state.regions.hit_test(pos);
+
+    // 1. Klick mit Iceds nativem Click-Helper klassifizieren
+    let iced_pos = iced::Point::new(pos.x, pos.y);
+    let new_click = Click::new(iced_pos, button, state.last_click);
+    state.last_click = Some(new_click);
+
+    // 2. Doppelklick sofort bei MouseDown erkennen (Grab-Tool + Plot-Bereich)
+    if button == mouse::Button::Left
+        && region == HitRegion::Plot
+      //  && program.current_tool() == Tool::Grab
+        && new_click.kind() == Kind::Double
+    {
+        // Nur einen Pin rückgängig machen, der exakt beim 1. Klick DIESES Doppelklicks gesetzt/gelöscht wurde
+        if let Some(pin_toggle) = state.last_pin_toggle.take() {
+            program.with_plot_mut(|plot| {
+                let pins = plot.pins_mut();
+                if pin_toggle.added {
+                    if let Some(index) = pins.iter().position(|p| *p == pin_toggle.pin) {
+                        pins.swap_remove(index);
+                    }
+                } else if !pins.contains(&pin_toggle.pin) {
+                    pins.push(pin_toggle.pin);
+                }
+            });
+        }
+
+        // Das folgende ButtonReleased dieses 2. Klicks ignorieren
+        state.ignore_next_release = true;
+        state.drag = None;
+        state.pending_click = None;
+
+        program.request_redraw();
+        return Some(canvas::Action::publish(Message::ResetView));
+    }
 
     let (mode, active) = match (button, region) {
         (mouse::Button::Left, HitRegion::Plot) => (DragMode::Pan, true),
@@ -189,6 +223,7 @@ fn handle_mouse_down(
 
     state.drag = Some(DragState::new(mode, pos, active));
     state.pending_click = Some(ClickState { region, button });
+    Some(Action::request_redraw())
 }
 
 fn handle_mouse_move(
@@ -320,6 +355,9 @@ fn handle_mouse_move(
     
     if !drag.active {
         state.pending_click = None;
+        //
+        state.last_click = None;
+        state.last_pin_toggle = None;
         return;
     }
 
@@ -388,6 +426,13 @@ fn handle_mouse_up(
     let drag = state.drag.take();
     let _click = state.pending_click.take();
 
+    // Wenn dieses Release zum 2. Klick eines Doppelklicks gehört, sauber verwerfen
+    if state.ignore_next_release {
+        state.ignore_next_release = false;
+        state.selection_rect = None;
+        return Some(canvas::Action::request_redraw());
+    }
+
     // Commit a box zoom (right-button drag) on release.
     if let (Some(drag), Some(selection)) = (drag.as_ref(), state.selection_rect.take()) {
         if drag.active && drag.mode == DragMode::ZoomRect {
@@ -405,48 +450,22 @@ fn handle_mouse_up(
         }
     }
 
-    // --- DOUBLE-CLICK DETECTION FOR RESETVIEW ---
-    // Check if this is a left-click release (not a drag) and detect double-click.
-    let was_click = button == mouse::Button::Left 
-        && drag.as_ref().is_none_or(|d| d.mode != DragMode::ZoomRect);
+    // Prüfen, ob es ein normaler Einzelklick war (kein Drag/Pan)
+      let was_click = button == mouse::Button::Left
+        && position.is_some_and(|pos| {
+            drag.as_ref().is_none_or(|d| {
+                d.mode != DragMode::ZoomRect
+                    && (d.start.x - pos.x).hypot(d.start.y - pos.y) < DRAG_THRESHOLD_PX
+            })
+        });
 
     if was_click {
         if let Some(pos) = position {
-            // Check if this is a double-click with the previously stored click
-            if let Some(last_click) = state.last_click {
-                if is_double_click(&last_click, pos, button) {
-                    // Double-click detected: UNDO the pin from the first click, then emit ResetView
-                    if let Some(pin_toggle) = state.last_pin_toggle.take() {
-                        program.with_plot_mut(|plot| {
-                            let pins = plot.pins_mut();
-                            if pin_toggle.added {
-                                // Pin was added by first click, remove it
-                                if let Some(index) = pins.iter().position(|p| *p == pin_toggle.pin) {
-                                    pins.swap_remove(index);
-                                }
-                            } else {
-                                // Pin was removed by first click, add it back
-                                pins.push(pin_toggle.pin);
-                            }
-                        });
-                    }
-                    state.last_click = None;
-                    state.last_pin_toggle = None;
-                    return Some(canvas::Action::publish(Message::ResetView));
-                } else {
-                    // Not a double-click: execute pin for THIS click immediately, 
-                    // and store it as the new "last click" for potential future double-click
-                    execute_pin_and_store(program, state, pos, button);
-                    return Some(canvas::Action::request_redraw());
-                }
-            } else {
-                // First click: execute pin immediately and store for potential double-click undo
-                execute_pin_and_store(program, state, pos, button);
-                return Some(canvas::Action::request_redraw());
-            }
+            execute_pin_and_store(program, state, pos);
+            return Some(canvas::Action::request_redraw());
         }
     } else {
-        // If it was a drag or right-click, clear the last_click but KEEP the pin (don't undo)
+        // Bei einem Drag (Pan/Zoom) den letzten Klick-Status löschen
         state.last_click = None;
         state.last_pin_toggle = None;
     }
@@ -455,12 +474,12 @@ fn handle_mouse_up(
     Some(canvas::Action::request_redraw())
 }
 
+
 /// Execute pin toggle immediately and store the result for potential double-click undo.
 fn execute_pin_and_store(
     program: &Program,
     state: &mut PlotUiState,
     pos: ScreenPoint,
-    button: mouse::Button,
 ) {
     if let (Some(transform), Some(plot_rect)) = (state.transform.clone(), state.plot_rect) {
         let (pin_threshold, unpin_threshold) = {
@@ -486,27 +505,24 @@ fn execute_pin_and_store(
             });
 
         if let Some(target) = target {
-            // Execute the pin toggle and capture whether it was added or removed
+            // Pin umschalten und merken, ob er hinzugefügt oder entfernt wurde
             let added = program.with_plot_mut(|plot| {
                 toggle_pin(plot.pins_mut(), target.pin)
             });
-            
-            // Store for potential double-click undo
+
+            // Nur für einen eventuellen direkt folgenden 2. Klick merken
             state.last_pin_toggle = Some(super::state::PinToggle {
                 pin: target.pin,
                 added,
                 at: Instant::now(),
                 screen_pos: pos,
             });
+            return;
         }
     }
-    
-    // Store this click for double-click detection
-    state.last_click = Some(LastClick {
-        position: pos,
-        button,
-        time: Instant::now(),
-    });
+
+    // WICHTIG: Ging der Klick ins Leere, darf kein älterer Pin für ein späteres Undo übrig bleiben!
+    state.last_pin_toggle = None;
 }
 
 fn handle_scroll(

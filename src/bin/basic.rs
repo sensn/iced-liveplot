@@ -56,6 +56,7 @@ impl App {
         );
 
         let mut plot = Plot::builder()
+              .id("top_plot")
             .theme(Theme::dark())
             .x_axis(AxisConfig::builder().title("Sample").build())
             .y_axis(AxisConfig::builder().title("Amplitude").build())
@@ -77,10 +78,16 @@ impl App {
                 self.program.request_redraw();
                 Task::none()
             }
+             Message::Plot(widget::Message::ResetView)  => {
+                                            self.program.with_plot_mut(|plot| { plot.reset_view(); });
+                        //self.program.reset_view(); 
+                        Task::none()
+                       // plot.pins_mut().clear(); // HIER ERGÄNZEN: Löscht den Geister-Pin des ersten Klicks!
+                    }
             // The widget already handled the interaction; a repaint was
             // requested via `request_redraw`.
             Message::Plot(_) => Task::none(),
-        }
+        }    
     }
 
    fn view(&self) -> impl Widget<Message> + use<'_> {
@@ -89,7 +96,6 @@ impl App {
         .height(iced::Length::Fill) // Macht das Widget so hoch wie das Fenster
         .map(Message::Plot)
 }
-
 
     fn subscription(&self) -> Subscription<Message> {
         iced::time::every(iced::time::milliseconds(250)).map(|_| Message::Tick)
