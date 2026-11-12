@@ -137,11 +137,6 @@ enum Message {
     Plot(PlotMessage),
 }
 
-/// Seconds → MIDI ticks at the current tempo (float tempo helper).
-fn sec_to_ticks_float(seconds: f64) -> u64 {
-    (seconds * 124.0 / 60.0 * PPQ as f64).round() as u64
-}
-
 /// Seconds → MIDI ticks at `tempo` BPM with PPQ resolution.
 fn sec_to_ticks(seconds: f64, tempo: f64) -> u64 {
     let beats = seconds * tempo / 60.0;
@@ -328,7 +323,7 @@ impl SequencerApp {
             .notes
             .iter()
             .enumerate()
-            .map(|(index, note)| Self::note_region_at(note, style, index))
+            .map(|(index, note)| Self::note_region_at(note, style, index, tempo))
             .collect();
 
         // ---- SELECTION: re-apply by MODEL IDENTITY (pitch/ticks) ----
@@ -365,6 +360,7 @@ impl SequencerApp {
         self.program.set_snap_engine(self.snap_engine.clone());
         let tpb = self.sequence.ticks_per_beat as u32;
         self.program.set_ticks_per_beat(tpb);
+        self.program.set_tempo_bpm(self.tempo); // drives ticks↔seconds
         self.program
             .set_beats_per_bar(self.sequence.time_signature.0 as u32);
         self.program.set_time_axis(self.time_axis);
@@ -464,12 +460,17 @@ impl SequencerApp {
         // Snap the target position when snapping is enabled: with snap OFF the
         // notes land at the EXACT playhead position; with snap ON they land on
         // the nearest grid line.
+        // The playhead lives in TICKS in the widget; converting through
+        // seconds with the CURRENT tempo keeps both representations identical
+        // (a hard-coded tempo would shift the paste whenever the tempo changes).
         let playhead = if self.snap_enabled {
-            self.snap_engine
-                .snap_position_seconds(self.playhead_seconds())
-                .map(sec_to_ticks_float)
+            let target_secs = self.program.playhead_seconds();
+            let snapped = self.snap_engine.snap_position_seconds(target_secs);
+            snapped
+                .map(|s| sec_to_ticks(s, self.tempo))
                 .unwrap_or_else(|| self.program.playhead_ticks())
         } else {
+            // Snap off: the exact playhead tick (no rounding through seconds).
             self.program.playhead_ticks()
         };
         let offset = playhead.saturating_sub(clip_start);
@@ -654,9 +655,14 @@ impl SequencerApp {
     /// written into `region.metadata["note_index"]` so tools address notes by
     /// MODEL INDEX (stable across plot rebuilds) instead of ephemeral
     /// region ids.
-    fn note_region_at(note: &MidiNote, style: &PianoRollStyle, index: usize) -> DataRegion {
-        let start = MidiNote::tick_to_seconds_static(note.start_tick, PPQ, 124.0);
-        let end = MidiNote::tick_to_seconds_static(note.end_tick, PPQ, 124.0);
+    fn note_region_at(
+        note: &MidiNote,
+        style: &PianoRollStyle,
+        index: usize,
+        tempo: f64,
+    ) -> DataRegion {
+        let start = MidiNote::tick_to_seconds_static(note.start_tick, PPQ, tempo);
+        let end = MidiNote::tick_to_seconds_static(note.end_tick, PPQ, tempo);
         let mut region = DataRegion::midi_note(note.pitch, note.velocity, note.channel, start, end);
         // Color by velocity using the piano roll gradient.
         let t = (note.velocity as f32 / 127.0) * (style.velocity_gradient.len() - 1) as f32;
@@ -1209,6 +1215,7 @@ impl SequencerApp {
             Message::SetTempo(bpm) => {
                 self.tempo = bpm.clamp(40.0, 300.0);
                 self.sequence.tempo = self.tempo;
+                self.program.set_tempo_bpm(self.tempo);
                 self.apply_snap_config();
                 self.rebuild_plot();
                 self.status = format!("Tempo: {:.0} BPM", self.tempo);

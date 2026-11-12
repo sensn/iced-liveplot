@@ -202,6 +202,8 @@ pub struct Program {
     pub(crate) time_axis: RefCell<TimeAxisMode>,
     /// Ticks per beat used when the axis shows ticks.
     pub(crate) ticks_per_beat: std::cell::Cell<u32>,
+    /// Tempo (BPM) for the tick↔seconds scale. 120 BPM = 960 ticks/s.
+    pub(crate) tempo_bpm: std::cell::Cell<f64>,
     /// Beats per bar (time signature numerator; e.g. 4 for 4/4).
     pub(crate) beats_per_bar: std::cell::Cell<u32>,
     /// Playhead position in MIDI ticks (0 = start).
@@ -320,6 +322,7 @@ impl Program {
             note_length: RefCell::new(NoteLength::Quarter),
             time_axis: RefCell::new(TimeAxisMode::default()),
             ticks_per_beat: std::cell::Cell::new(480),
+            tempo_bpm: std::cell::Cell::new(120.0),
             beats_per_bar: std::cell::Cell::new(4),
             playhead_ticks: std::cell::Cell::new(0),
             clock: RefCell::new(crate::clock::Clock::with_ppq(120.0, 480)),
@@ -485,6 +488,24 @@ impl Program {
         self.request_redraw();
     }
 
+    /// Tempo driving the tick↔seconds conversion.
+    pub fn tempo_bpm(&self) -> f64 {
+        self.tempo_bpm.get()
+    }
+
+    /// Set the tempo used for tick↔seconds conversions (axis, playhead, tools).
+    pub fn set_tempo_bpm(&self, bpm: f64) {
+        self.tempo_bpm.set(bpm.clamp(1.0, 1000.0));
+        self.request_redraw();
+    }
+
+    /// Ticks per second at the current tempo (PPQ × BPM / 60).
+    pub(crate) fn ticks_per_second(&self) -> f64 {
+        let tpb = self.ticks_per_beat.get().max(1) as f64;
+        let bpm = self.tempo_bpm.get().max(1.0);
+        tpb * bpm / 60.0
+    }
+
     /// Beats per bar for the musical position axis (time signature numerator).
     pub fn beats_per_bar(&self) -> u32 {
         self.beats_per_bar.get()
@@ -544,6 +565,7 @@ impl Program {
     fn apply_time_axis_formatter(&self) {
         let mode = *self.time_axis.borrow();
         let tpb = self.ticks_per_beat.get().max(1) as f64;
+        let ticks_per_sec = self.ticks_per_second();
         let beats_per_bar = self.beats_per_bar.get().max(1) as f64;
         self.with_plot_mut(|plot| match mode {
             TimeAxisMode::Seconds => {
@@ -553,13 +575,13 @@ impl Program {
             }
             TimeAxisMode::Ticks => {
                 plot.x_axis_mut().set_formatter(crate::axis::AxisFormatter::Custom(
-                    std::sync::Arc::new(move |v| format!("{}", (v * tpb * 2.0).round() as i64)),
+                    std::sync::Arc::new(move |v| format!("{}", (v * ticks_per_sec).round() as i64)),
                 ));
             }
             TimeAxisMode::Bars => {
                 plot.x_axis_mut().set_formatter(crate::axis::AxisFormatter::Custom(
                     std::sync::Arc::new(move |v| {
-                        let ticks = (v * tpb * 2.0).round() as i64;
+                        let ticks = (v * ticks_per_sec).round() as i64;
                         let beat = ticks as f64 / tpb;
                         let bar = (beat / beats_per_bar).floor() as i64 + 1;
                         let beat_in_bar = beat - (bar as f64 - 1.0) * beats_per_bar;
@@ -582,10 +604,9 @@ impl Program {
         self.request_redraw();
     }
 
-    /// Playhead position in seconds (PPQ scale: 1 tick = 1/(tpb*2) s).
+    /// Playhead position in seconds (tempo aware).
     pub fn playhead_seconds(&self) -> f64 {
-        let tpb = self.ticks_per_beat.get().max(1) as f64;
-        self.playhead_ticks.get() as f64 / (tpb * 2.0)
+        self.playhead_ticks.get() as f64 / self.ticks_per_second()
     }
 
     /// Undo the last widget-level edit. Returns true when something was undone.

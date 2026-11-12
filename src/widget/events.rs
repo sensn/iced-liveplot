@@ -194,8 +194,7 @@ fn handle_mouse_down(
     if button == mouse::Button::Left && region == HitRegion::XAxis {
         if let Some(transform) = state.transform.clone() {
             if let Some(point) = transform.screen_to_data(pos) {
-                let tpb = program.ticks_per_beat().max(1) as f64;
-                let ticks = (point.x * tpb * 2.0).round().max(0.0) as u64;
+                let ticks = (point.x * program.ticks_per_second()).round().max(0.0) as u64;
                 program.set_playhead_ticks(ticks);
                 return;
             }
@@ -818,8 +817,7 @@ pub(crate) fn run_tool_mouse(
                     })
                     .collect();
                 let tick_of = |seconds: f64| -> i64 {
-                    let tpb = program.ticks_per_beat().max(1) as f64;
-                    (seconds * tpb * 2.0).round() as i64
+                    (seconds * program.ticks_per_second()).round() as i64
                 };
                 // Model indices live in the region metadata (`note_index`),
                 // written by the host when it mirrors its model into regions.
@@ -965,8 +963,7 @@ fn finish_tool_gesture(
                         })
                         .collect();
                     if !indices.is_empty() {
-                        let tpb = program.ticks_per_beat().max(1) as f64;
-                        let tick = (position.x * tpb * 2.0).round().max(0.0) as u64;
+                        let tick = (position.x * program.ticks_per_second()).round().max(0.0) as u64;
                         program.emit_tool_event(ToolEvent::Midi(MidiEdit::Split {
                             targets: NoteTargets { indices },
                             tick,
