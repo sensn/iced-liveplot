@@ -797,7 +797,11 @@ impl SequencerApp {
                 }
                 self.status = format!("Moved {} note(s) ({:+} ticks, {:+} st)", moved, dt_ticks, dy_semitones);
             }
-            MidiEdit::Resize { targets, edge, tick } => {
+            MidiEdit::Resize { targets, edge, dt_ticks } => {
+                // Trim semantics (Logic Pro): the same cursor travel is applied
+                // to every target, so grouped events keep their relative
+                // lengths. Each event is independently clamped so it never
+                // collapses (min 1 tick) and never starts before 0.
                 let indices = self.target_indices(targets.indices.first().copied(), track_len);
                 let mut resized = 0;
                 let notes = &mut self.sequence.tracks[self.active].notes;
@@ -806,23 +810,28 @@ impl SequencerApp {
                         let note = &mut notes[index];
                         match edge {
                             ResizeEdge::Start => {
-                                note.start_tick = tick.min(note.end_tick.saturating_sub(1));
+                                let want = note.start_tick as i64 + dt_ticks;
+                                // keep at least 1 tick of the note, and >= 0
+                                let limit = (note.end_tick as i64 - 1).max(0);
+                                note.start_tick = want.clamp(0, limit) as u64;
                             }
                             ResizeEdge::End => {
-                                note.end_tick = tick.max(note.start_tick + 1);
+                                let want = note.end_tick as i64 + dt_ticks;
+                                let floor = note.start_tick as i64 + 1;
+                                note.end_tick = want.max(floor) as u64;
                             }
                         }
                         resized += 1;
                     }
                 }
                 self.status = format!(
-                    "Resized {} edge of {} note(s) to tick {}",
+                    "Trimmed {} edge of {} note(s) by {:+} ticks",
                     match edge {
                         ResizeEdge::Start => "start",
                         ResizeEdge::End => "end",
                     },
                     resized,
-                    tick
+                    dt_ticks
                 );
             }
             MidiEdit::Delete { targets } => {

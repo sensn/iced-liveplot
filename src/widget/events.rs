@@ -18,7 +18,7 @@ use crate::view::Viewport;
 
 use super::hover::update_hover_target;
 use super::state::{ClickState, DragMode, DragState, LastClick, PlotUiState};
-use super::tools::{MoveGesture, ToolGesture, ToolState};
+use super::tools::{MoveGesture, ToolGesture, ToolState, TrimZone};
 use super::{Message, MidiEdit, NoteTargets, Program, ResizeEdge, Tool, ToolEvent};
 
 /// Scroll wheel line height in pixels (matches the GPUI backend default).
@@ -646,24 +646,33 @@ pub(crate) fn run_tool_mouse(
     let Some(plot_rect) = state.plot_rect else {
         return;
     };
-    // Restrict to the plot area
-    if !super::geometry::rect_contains(plot_rect, pos) {
+    let inside = super::geometry::rect_contains(plot_rect, pos);
+    // Starting a gesture outside the plot is meaningless, but a drag that
+    // wanders out (for instance shrinking a note past the left edge) must keep
+    // tracking so the release can still commit — therefore the Up phase always
+    // converts, while Down/Move require the cursor to be inside.
+    if !inside && phase != ToolPhase::Up {
         return;
     }
 
     let raw_point = transform.screen_to_data(pos).unwrap_or(crate::geom::Point::new(0.0, 0.0));
 
-    // Snap the point using the program's snap engine
-    let (snapped_point, _did_snap) = program.with_snap(|snap| {
-        let regions: Vec<crate::region::DataRegion> = program.plot().regions().to_vec();
-        let view_range = program
-            .plot()
-            .viewport()
-            .map(|v| crate::region::Range::new(v.x.min, v.x.max))
-            .unwrap_or(crate::region::Range::new(0.0, 1.0));
-        let result = snap.snap(raw_point, &regions, &transform, view_range, 120.0);
-        (result.point, result.snapped)
-    });
+    // Snap the point using the program's snap engine. The pen, move and trim
+    // gestures all snap so edits land on the musical grid.
+    let (snapped_point, _did_snap) = if inside {
+        program.with_snap(|snap| {
+            let regions: Vec<crate::region::DataRegion> = program.plot().regions().to_vec();
+            let view_range = program
+                .plot()
+                .viewport()
+                .map(|v| crate::region::Range::new(v.x.min, v.x.max))
+                .unwrap_or(crate::region::Range::new(0.0, 1.0));
+            let result = snap.snap(raw_point, &regions, &transform, view_range, 120.0);
+            (result.point, result.snapped)
+        })
+    } else {
+        (raw_point, false)
+    };
 
     let screen = pos;
 
@@ -711,25 +720,40 @@ pub(crate) fn run_tool_mouse(
         return;
     }
 
-    // ---- MOVE / SCALE / STRETCH (model-index based, DAW semantics) ----
+    // ---- MOVE / SCALE / STRETCH: zone based, DAW semantics ----
     //
-    // A gesture starts ONLY when the press lands on a region — empty space
-    // never moves anything (panning stays with the Grab tool). The whole group
-    // of "pressed + box-selected" regions travels with the cursor; the delta
-    // is measured in data units, so where inside an event you press is
-    // irrelevant. Edits carry MODEL INDICES taken from region metadata
-    // (`note_index`), so the host can apply them after any rebuild without
-    // fragile region-id bookkeeping.
+    // Pointer zones inside an event (Logic Pro / Ableton style):
+    //   * left strip  ~TRIM_ZONE_PX          → trim the START edge
+    //   * right strip ~TRIM_ZONE_PX          → trim the END edge
+    //   * middle                              → MOVE (event or whole selection)
+    // * empty space never starts any gesture (panning stays with Grab);
+    // * Scale/Stretch are dedicated edge tools that always trim that edge
+    //   (they ignore the zone);
+    // * Move uses the zone under the cursor.
     if matches!(tool, Tool::Move | Tool::Scale | Tool::Stretch) {
-        let forced_edge = match tool {
-            Tool::Scale => Some(ResizeEdge::Start),
-            Tool::Stretch => Some(ResizeEdge::End),
+        let forced_zone = match tool {
+            Tool::Scale => Some(TrimZone::Start),
+            Tool::Stretch => Some(TrimZone::End),
             _ => None,
+        };
+        let zone_to_edge = |zone: TrimZone| -> Option<ResizeEdge> {
+            match zone {
+                TrimZone::Start => Some(ResizeEdge::Start),
+                TrimZone::End => Some(ResizeEdge::End),
+                TrimZone::Move => None,
+            }
         };
         match phase {
             ToolPhase::Down => {
-                // Press must land on a region, otherwise the gesture is inert.
+                // A gesture needs a region under the pointer.
                 let Some(region) = region_at(program, &transform, snapped_point) else {
+                    return;
+                };
+                let zone = forced_zone.or_else(|| {
+                    TrimZone::zone_for(pos, &region, &transform)
+                });
+                // No zone (cursor outside the region) → inert gesture.
+                let Some(zone) = zone else {
                     return;
                 };
                 let primary = region.clone();
@@ -740,37 +764,13 @@ pub(crate) fn run_tool_mouse(
                         targets.push(r.clone());
                     }
                 }
-                // Edge detection for the plain Move tool (±8 px). With a group
-                // an edge press becomes a group resize; a single target keeps
-                // plain move behaviour.
-                let edge = match forced_edge {
-                    Some(edge) => Some(edge),
-                    None => {
-                        let edge_px = 8.0_f32;
-                        let span = transform.screen().width().max(1.0);
-                        let edge_data = f64::from(edge_px) / f64::from(span);
-                        let clicked_edge = primary.time_range().and_then(|t| {
-                            if (snapped_point.x - t.min) <= edge_data {
-                                Some(ResizeEdge::Start)
-                            } else if (t.max - snapped_point.x) <= edge_data {
-                                Some(ResizeEdge::End)
-                            } else {
-                                None
-                            }
-                        });
-                        match clicked_edge {
-                            Some(edge) if targets.len() > 1 => Some(edge),
-                            _ => None,
-                        }
-                    }
-                };
                 let grab = snapped_point;
                 program.with_tool_state(|ts| {
                     ts.drag_move = MoveGesture {
                         primary: Some(primary.id),
                         grab,
                         current: grab,
-                        edge,
+                        zone: Some(zone),
                         targets: targets
                             .iter()
                             .filter_map(|r| r.time_range().map(|t| (r.id, t.min, t.max)))
@@ -788,9 +788,8 @@ pub(crate) fn run_tool_mouse(
                 });
             }
             ToolPhase::Up => {
-                // `current` is updated by the move handler, but the release
-                // position is authoritative (the last motion event may be
-                // coalesced or skipped) — refresh it before computing deltas.
+                // The release position is authoritative: the last motion
+                // event may be coalesced or dropped.
                 let release = snapped_point;
                 let gesture = program.with_tool_state(|ts| {
                     let mut g = std::mem::take(&mut ts.drag_move);
@@ -818,9 +817,9 @@ pub(crate) fn run_tool_mouse(
                         program.plot().regions().iter().find(|r| r.id == *id).cloned()
                     })
                     .collect();
-                let tick_of = |seconds: f64| -> u64 {
+                let tick_of = |seconds: f64| -> i64 {
                     let tpb = program.ticks_per_beat().max(1) as f64;
-                    (seconds * tpb * 2.0).round().max(0.0) as u64
+                    (seconds * tpb * 2.0).round() as i64
                 };
                 // Model indices live in the region metadata (`note_index`),
                 // written by the host when it mirrors its model into regions.
@@ -838,28 +837,23 @@ pub(crate) fn run_tool_mouse(
                     return; // not a MIDI region — nothing to edit
                 }
                 let targets = NoteTargets { indices: model_indices };
-                match gesture.edge {
-                    Some(edge) => {
-                        // Group resize: the same absolute edge time for all.
-                        let tick = tick_of(gesture.current.x);
-                        program.emit_tool_event(ToolEvent::Midi(MidiEdit::Resize {
-                            targets,
-                            edge,
-                            tick,
-                        }));
-                    }
+                let dt_ticks = tick_of(dx);
+                let dy_semi = dy.round().clamp(-127.0, 127.0) as i8;
+                match zone_to_edge(gesture.zone.unwrap_or(TrimZone::Move)) {
+                    // Middle (or a move gesture) → move the whole group.
                     None => {
-                        // Move: the same tick/pitch delta for the whole group.
-                        let dt_ticks = if dx < 0.0 {
-                            -(tick_of(-dx) as i64)
-                        } else {
-                            tick_of(dx) as i64
-                        };
-                        let dy_semi = dy.round().clamp(-127.0, 127.0) as i8;
                         program.emit_tool_event(ToolEvent::Midi(MidiEdit::Move {
                             targets,
                             dt_ticks,
                             dy_semitones: dy_semi,
+                        }));
+                    }
+                    // Left/right strip → trim the group by the cursor travel.
+                    Some(edge) => {
+                        program.emit_tool_event(ToolEvent::Midi(MidiEdit::Resize {
+                            targets,
+                            edge,
+                            dt_ticks,
                         }));
                     }
                 }

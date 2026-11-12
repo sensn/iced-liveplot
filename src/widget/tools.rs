@@ -188,8 +188,8 @@ pub struct MoveGesture {
     pub grab: crate::geom::Point,
     /// Data-space point of the current drag position.
     pub current: crate::geom::Point,
-    /// Edge grabbed, if any (resize instead of move).
-    pub edge: Option<super::ResizeEdge>,
+    /// Zone grabbed (`None` = middle → move).
+    pub zone: Option<TrimZone>,
     /// All regions participating in the gesture (primary + box-selection).
     /// Per-region grab offsets are stored alongside so every event keeps its
     /// relative distance to the cursor.
@@ -204,7 +204,7 @@ impl Default for MoveGesture {
             primary: None,
             grab: crate::geom::Point::new(0.0, 0.0),
             current: crate::geom::Point::new(0.0, 0.0),
-            edge: None,
+            zone: None,
             targets: Vec::new(),
             active: false,
         }
@@ -215,7 +215,7 @@ impl MoveGesture {
     fn clear(&mut self) {
         self.active = false;
         self.primary = None;
-        self.edge = None;
+        self.zone = None;
         self.targets.clear();
     }
 
@@ -228,6 +228,25 @@ impl MoveGesture {
     pub fn dy(&self) -> f64 {
         self.current.y - self.grab.y
     }
+}
+
+/// Width (in screen pixels) of the start/end trim zones.
+///
+/// Fixed PIXEL width (not data units) so the grab areas feel identical at any
+/// zoom level — exactly how Logic Pro / Ableton behave.
+pub const TRIM_ZONE_PX: f32 = 9.0;
+
+/// Which part of an event the pointer is over.
+///
+/// This is the single source of truth for the tool mechanism:
+/// * [`TrimZone::Start`] / [`TrimZone::End`] → dragging trims that edge;
+/// * [`TrimZone::Move`] → dragging moves the whole event/selection;
+/// * [`TrimZone::None`] → nothing under the cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrimZone {
+    Start,
+    End,
+    Move,
 }
 
 /// Tool state machine
@@ -572,4 +591,50 @@ mod tests {
         state.end_drag();
         assert!(!state.gesture().is_active());
     }
+}
+impl TrimZone {
+    /// Detect which zone a screen point falls into for a region.
+    ///
+    /// Uses FIXED pixel widths so the trim areas are equally easy to grab at
+    /// every zoom level (DAW behaviour). Regions narrower than twice the trim
+    /// width always report [`TrimZone::Move`] so tiny notes stay draggable.
+    pub fn zone_for(
+        screen: crate::geom::ScreenPoint,
+        region: &crate::region::DataRegion,
+        transform: &crate::transform::Transform,
+    ) -> Option<TrimZone> {
+        let bounds = region.screen_bounds(transform)?;
+        // Vertical containment
+        let top = bounds.min.y.min(bounds.max.y);
+        let bottom = bounds.min.y.max(bounds.max.y);
+        let inside_y = screen.y >= top && screen.y <= bottom;
+        let x = screen.x;
+        let left = bounds.min.x.min(bounds.max.x);
+        let right = bounds.min.x.max(bounds.max.x);
+        let inside_x = x >= left && x <= right;
+        if !inside_x {
+            // Allow a small horizontal tolerance so clicks just outside the
+            // event's outline still grab it.
+            let tol = TRIM_ZONE_PX * 0.5;
+            if x < left - tol || x > right + tol {
+                return None;
+            }
+        }
+        let width = right - left;
+        let zone = if width <= TRIM_ZONE_PX * 2.0 {
+            // Too narrow: everything is a move.
+            TrimZone::Move
+        } else if x - left <= TRIM_ZONE_PX {
+            TrimZone::Start
+        } else if right - x <= TRIM_ZONE_PX {
+            TrimZone::End
+        } else {
+            TrimZone::Move
+        };
+        // If the cursor is outside vertically the hit-test fails, except for
+        // full-height regions (loop markers) which intentionally span the plot.
+        Some(zone).filter(|_| inside_y || region.value_range().is_none())
+    }
+
+
 }

@@ -274,8 +274,13 @@ pub enum MidiEdit {
     Insert { pitch: u8, velocity: u8, start_tick: u64, end_tick: u64 },
     /// Move the notes identified by `NoteTargets` by a tick/pitch delta.
     Move { targets: NoteTargets, dt_ticks: i64, dy_semitones: i8 },
-    /// Resize an edge of the notes identified by `NoteTargets`.
-    Resize { targets: NoteTargets, edge: ResizeEdge, tick: u64 },
+    /// Resize an edge of the notes identified by `NoteTargets` by a delta.
+    ///
+    /// `dt_ticks` is the cursor travel in ticks, exactly like `Move`. Applying
+    /// the SAME delta to every target keeps the relative lengths of grouped
+    /// events intact (Logic Pro semantics) — an absolute edge position would
+    /// snap every event to the same border.
+    Resize { targets: NoteTargets, edge: ResizeEdge, dt_ticks: i64 },
     /// Delete the notes identified by `NoteTargets`.
     Delete { targets: NoteTargets },
     /// Split the notes at the given tick (only those containing it).
@@ -321,6 +326,133 @@ impl Program {
         }
     }
 
+    // ==================== Domain / tool / snap / transport ====================
+
+    /// The active editing domain.
+    pub fn domain(&self) -> Domain {
+        *self.domain.borrow()
+    }
+
+    /// Set the active editing domain. Adjusts the Y axis to the domain
+    /// convention (MIDI: note numbers 0-127; Automation: unitless).
+    pub fn set_domain(&self, domain: Domain) {
+        *self.domain.borrow_mut() = domain;
+        let midi_fmt = crate::axis::AxisFormatter::Custom(std::sync::Arc::new(|v| {
+            let n = v.round().clamp(0.0, 127.0) as u8;
+            format!("{} ({})", n, crate::midi::midi_note_name(n))
+        }));
+        let auto_fmt = crate::axis::AxisFormatter::Custom(std::sync::Arc::new(|v| {
+            format!("{:.2}", v)
+        }));
+        self.with_plot_mut(|plot| match domain {
+            Domain::Midi => plot.y_axis_mut().set_formatter(midi_fmt),
+            Domain::Automation => plot.y_axis_mut().set_formatter(auto_fmt),
+            _ => {}
+        });
+        self.apply_time_axis_formatter();
+        self.request_redraw();
+    }
+
+    /// The MIDI pen note length.
+    pub fn note_length(&self) -> NoteLength {
+        *self.note_length.borrow()
+    }
+
+    /// Set the MIDI pen note length.
+    pub fn set_note_length(&self, len: NoteLength) {
+        *self.note_length.borrow_mut() = len;
+        self.request_redraw();
+    }
+
+    /// The X axis display mode.
+    pub fn time_axis(&self) -> TimeAxisMode {
+        *self.time_axis.borrow()
+    }
+
+    /// Switch the X axis between seconds, ticks and bars.
+    pub fn set_time_axis(&self, mode: TimeAxisMode) {
+        *self.time_axis.borrow_mut() = mode;
+        self.apply_time_axis_formatter();
+        self.request_redraw();
+    }
+
+    /// Read access to the snap engine.
+    pub fn snap(&self) -> std::cell::Ref<'_, crate::snap::SnapEngine> {
+        self.snap.borrow()
+    }
+
+    /// Mutably access the snap engine.
+    pub fn with_snap<R>(&self, f: impl FnOnce(&mut crate::snap::SnapEngine) -> R) -> R {
+        f(&mut self.snap.borrow_mut())
+    }
+
+    /// Replace the snap engine (sync an external config into the widget).
+    pub fn set_snap_engine(&self, engine: crate::snap::SnapEngine) {
+        *self.snap.borrow_mut() = engine;
+        self.request_redraw();
+    }
+
+    /// Enable/disable snapping.
+    pub fn set_snap_enabled(&self, enabled: bool) {
+        self.with_snap(|snap| snap.config_mut().enabled = enabled);
+        self.request_redraw();
+    }
+
+    /// Register the callback invoked when tools emit domain mutations.
+    pub fn set_tool_event_handler(&self, handler: ToolEventCallback) {
+        *self.tool_event.borrow_mut() = Some(handler);
+    }
+
+    /// Emit a tool event to the host app. Returns whether it was handled.
+    pub(crate) fn emit_tool_event(&self, event: ToolEvent) -> bool {
+        if let Some(handler) = self.tool_event.borrow().as_ref() {
+            handler(event)
+        } else {
+            false
+        }
+    }
+
+    /// Start the transport.
+    pub fn play(&self) {
+        self.clock.borrow_mut().start();
+    }
+
+    /// Pause the transport.
+    pub fn pause(&self) {
+        self.clock.borrow_mut().stop();
+    }
+
+    pub fn is_playing(&self) -> bool {
+        self.clock.borrow().playing
+    }
+
+    /// Set the transport tempo.
+    pub fn set_transport_bpm(&self, bpm: f64) {
+        self.clock.borrow_mut().set_bpm(bpm);
+    }
+
+    /// Advance the transport clock and move the playhead accordingly.
+    /// Returns the tick delta since the previous call (0 while stopped).
+    pub fn tick_transport(&self) -> u64 {
+        let delta = self.clock.borrow_mut().update();
+        if delta > 0 {
+            let next = self.playhead_ticks.get() + delta;
+            self.playhead_ticks.set(next);
+            self.request_redraw();
+        }
+        delta
+    }
+
+    /// Read-only access to the transport clock.
+    pub fn clock(&self) -> std::cell::Ref<'_, crate::clock::Clock> {
+        self.clock.borrow()
+    }
+
+    /// Mutably access the transport clock.
+    pub fn clock_mut(&self) -> std::cell::RefMut<'_, crate::clock::Clock> {
+        self.clock.borrow_mut()
+    }
+
     /// Access the tool state (current tool, active gesture).
     pub fn tool_state(&self) -> std::cell::Ref<'_, ToolState> {
         self.tool_state.borrow()
@@ -342,128 +474,7 @@ impl Program {
         self.tool_state.borrow().current_tool()
     }
 
-    /// Replace the snap engine (e.g. to sync app config into the widget).
-    pub fn set_snap_engine(&self, engine: SnapEngine) {
-        *self.snap.borrow_mut() = engine;
-        self.request_redraw();
-    }
-
-    /// Read access to the snap engine.
-    pub fn snap(&self) -> std::cell::Ref<'_, SnapEngine> {
-        self.snap.borrow()
-    }
-
-    /// Mutably access the snap engine.
-    pub fn with_snap<R>(&self, f: impl FnOnce(&mut SnapEngine) -> R) -> R {
-        f(&mut self.snap.borrow_mut())
-    }
-
-    /// Register the callback invoked when tools emit domain mutations.
-    pub fn set_tool_event_handler(&self, handler: ToolEventCallback) {
-        *self.tool_event.borrow_mut() = Some(handler);
-    }
-
-    /// Emit a tool event to the host app. Returns whether it was handled.
-    pub(crate) fn emit_tool_event(&self, event: ToolEvent) -> bool {
-        if let Some(handler) = self.tool_event.borrow().as_ref() {
-            handler(event)
-        } else {
-            false
-        }
-    }
-
-    /// Enable/disable snapping (convenience for demos).
-    pub fn set_snap_enabled(&self, enabled: bool) {
-        self.with_snap(|snap| snap.config_mut().enabled = enabled);
-        self.request_redraw();
-    }
-
-    /// The active editing domain.
-    pub fn domain(&self) -> Domain {
-        *self.domain.borrow()
-    }
-
-    /// Set the active editing domain. Adjusts the Y axis to the domain
-    /// convention (MIDI: note numbers 0-127; Automation: 0-1 unitless).
-    pub fn set_domain(&self, domain: Domain) {
-        *self.domain.borrow_mut() = domain;
-        // Domain-specific Y axis formatting
-        let midi_fmt = crate::axis::AxisFormatter::Custom(std::sync::Arc::new(|v| {
-            let n = v.round().clamp(0.0, 127.0) as u8;
-            format!("{} ({})", n, crate::midi::midi_note_name(n))
-        }));
-        let auto_fmt = crate::axis::AxisFormatter::Custom(std::sync::Arc::new(|v| {
-            format!("{:.2}", v)
-        }));
-        self.with_plot_mut(|plot| match domain {
-            Domain::Midi => {
-                plot.y_axis_mut().set_formatter(midi_fmt);
-            }
-            Domain::Automation => {
-                plot.y_axis_mut().set_formatter(auto_fmt);
-            }
-            _ => {}
-        });
-        self.apply_time_axis_formatter();
-        self.request_redraw();
-    }
-
-    /// Apply the X axis formatter for the current time-axis mode.
-    fn apply_time_axis_formatter(&self) {
-        let mode = *self.time_axis.borrow();
-        let tpb = self.ticks_per_beat.get().max(1) as f64;
-        self.with_plot_mut(|plot| match mode {
-            TimeAxisMode::Seconds => {
-                plot.x_axis_mut().set_formatter(
-                    crate::axis::AxisFormatter::Custom(std::sync::Arc::new(|v| format!("{:.1}s", v))),
-                );
-            }
-            TimeAxisMode::Ticks => {
-                plot.x_axis_mut().set_formatter(crate::axis::AxisFormatter::Custom(
-                    std::sync::Arc::new(move |v| format!("{}", (v * tpb * 2.0).round() as i64)),
-                ));
-            }
-            TimeAxisMode::Bars => {
-                let beats_per_bar = self.beats_per_bar.get().max(1) as f64;
-                plot.x_axis_mut().set_formatter(crate::axis::AxisFormatter::Custom(
-                    std::sync::Arc::new(move |v| {
-                        // seconds -> ticks -> beats -> bar.beat (time signature
-                        // numerator drives the bar length).
-                        let ticks = (v * tpb * 2.0).round() as i64;
-                        let beat = ticks as f64 / tpb;
-                        let bar = (beat / beats_per_bar).floor() as i64 + 1;
-                        let beat_in_bar = beat - (bar as f64 - 1.0) * beats_per_bar;
-                        format!("{}.{:03}", bar, (beat_in_bar * 1000.0).round() as i64)
-                    }),
-                ));
-            }
-        });
-    }
-
-    /// The MIDI pen note length.
-    pub fn note_length(&self) -> NoteLength {
-        *self.note_length.borrow()
-    }
-
-    /// Set the MIDI pen note length.
-    pub fn set_note_length(&self, len: NoteLength) {
-        *self.note_length.borrow_mut() = len;
-        self.request_redraw();
-    }
-
-    /// The X axis display mode.
-    pub fn time_axis(&self) -> TimeAxisMode {
-        *self.time_axis.borrow()
-    }
-
-    /// Switch the X axis between seconds and ticks.
-    pub fn set_time_axis(&self, mode: TimeAxisMode) {
-        *self.time_axis.borrow_mut() = mode;
-        self.apply_time_axis_formatter();
-        self.request_redraw();
-    }
-
-    /// Ticks per beat for tick-axis display and tick conversions.
+    /// Ticks per beat used when the axis shows ticks.
     pub fn ticks_per_beat(&self) -> u32 {
         self.ticks_per_beat.get()
     }
@@ -486,70 +497,95 @@ impl Program {
         self.request_redraw();
     }
 
+    /// Which resize edge (if any) the cursor is currently over.
+    ///
+    /// Uses the same pixel-based zone detection as the Move tool
+    /// ([`crate::widget::tools::TRIM_ZONE_PX`]), so the cursor hint and the
+    /// gesture behaviour never disagree. Returns `None` when the pointer is
+    /// not over a start/end trim strip (middle of an event → move).
+    pub fn resize_edge_at(
+        &self,
+        state: &crate::widget::state::PlotUiState,
+        screen: crate::geom::ScreenPoint,
+    ) -> Option<ResizeEdge> {
+        let transform = state.transform.clone()?;
+        let plot_rect = state.plot_rect?;
+        if !crate::widget::geometry::rect_contains(plot_rect, screen) {
+            return None;
+        }
+        let tool = self.current_tool();
+        // The dedicated edge tools always trim, so their cursor is always the
+        // resize cursor over the matching strip.
+        let plot = self.plot.borrow();
+        let hit = plot
+            .regions()
+            .iter()
+            .filter(|r| r.visible && !r.locked)
+            .filter_map(|r| {
+                let zone = crate::widget::tools::TrimZone::zone_for(screen, r, &transform)?;
+                match zone {
+                    crate::widget::tools::TrimZone::Start => Some((r, ResizeEdge::Start)),
+                    crate::widget::tools::TrimZone::End => Some((r, ResizeEdge::End)),
+                    crate::widget::tools::TrimZone::Move => None,
+                }
+            })
+            .max_by_key(|(r, _)| r.z_index)?;
+        let (_, edge) = hit;
+        // For Move/Grab the cursor only changes over the matching strip.
+        match tool {
+            Tool::Scale if edge == ResizeEdge::End => return None,
+            Tool::Stretch if edge == ResizeEdge::Start => return None,
+            _ => {}
+        }
+        Some(edge)
+    }
+
+    /// Apply the X axis formatter for the current time-axis mode.
+    fn apply_time_axis_formatter(&self) {
+        let mode = *self.time_axis.borrow();
+        let tpb = self.ticks_per_beat.get().max(1) as f64;
+        let beats_per_bar = self.beats_per_bar.get().max(1) as f64;
+        self.with_plot_mut(|plot| match mode {
+            TimeAxisMode::Seconds => {
+                plot.x_axis_mut().set_formatter(
+                    crate::axis::AxisFormatter::Custom(std::sync::Arc::new(|v| format!("{:.1}s", v))),
+                );
+            }
+            TimeAxisMode::Ticks => {
+                plot.x_axis_mut().set_formatter(crate::axis::AxisFormatter::Custom(
+                    std::sync::Arc::new(move |v| format!("{}", (v * tpb * 2.0).round() as i64)),
+                ));
+            }
+            TimeAxisMode::Bars => {
+                plot.x_axis_mut().set_formatter(crate::axis::AxisFormatter::Custom(
+                    std::sync::Arc::new(move |v| {
+                        let ticks = (v * tpb * 2.0).round() as i64;
+                        let beat = ticks as f64 / tpb;
+                        let bar = (beat / beats_per_bar).floor() as i64 + 1;
+                        let beat_in_bar = beat - (bar as f64 - 1.0) * beats_per_bar;
+                        format!("{}.{:03}", bar, (beat_in_bar * 1000.0).round() as i64)
+                    }),
+                ));
+            }
+        });
+    }
+
     /// Playhead position in ticks.
     pub fn playhead_ticks(&self) -> u64 {
         self.playhead_ticks.get()
     }
 
-    /// Move the playhead to a tick position (and pause the clock reference).
+    /// Move the playhead to a tick position.
     pub fn set_playhead_ticks(&self, ticks: u64) {
         self.playhead_ticks.set(ticks);
         self.clock.borrow_mut().seek_ticks(ticks);
         self.request_redraw();
     }
 
-    /// Playhead position in seconds (uses the plot's time scale: 2 beats/sec
-    /// at 120 BPM => 1 tick = PPQ/2 per second, matching `PPQ` = 480).
+    /// Playhead position in seconds (PPQ scale: 1 tick = 1/(tpb*2) s).
     pub fn playhead_seconds(&self) -> f64 {
         let tpb = self.ticks_per_beat.get().max(1) as f64;
         self.playhead_ticks.get() as f64 / (tpb * 2.0)
-    }
-
-    /// Move the playhead to a seconds position.
-    pub fn set_playhead_seconds(&self, seconds: f64) {
-        let tpb = self.ticks_per_beat.get().max(1) as f64;
-        let ticks = (seconds * tpb * 2.0).round().max(0.0) as u64;
-        self.set_playhead_ticks(ticks);
-    }
-
-    /// Advance the transport clock and move the playhead accordingly.
-    /// Returns the tick delta since the previous call (0 while stopped).
-    pub fn tick_transport(&self) -> u64 {
-        let delta = self.clock.borrow_mut().update();
-        if delta > 0 {
-            let next = self.playhead_ticks.get() + delta;
-            self.playhead_ticks.set(next);
-            self.request_redraw();
-        }
-        delta
-    }
-
-    /// Start/pause the transport.
-    pub fn play(&self) {
-        self.clock.borrow_mut().start();
-    }
-
-    pub fn pause(&self) {
-        self.clock.borrow_mut().stop();
-    }
-
-    pub fn is_playing(&self) -> bool {
-        self.clock.borrow().playing
-    }
-
-    /// Set the transport tempo.
-    pub fn set_transport_bpm(&self, bpm: f64) {
-        self.clock.borrow_mut().set_bpm(bpm);
-    }
-
-    /// Mutably access the transport clock.
-    pub fn clock_mut(&self) -> std::cell::RefMut<'_, crate::clock::Clock> {
-        self.clock.borrow_mut()
-    }
-
-    /// Read-only access to the transport clock.
-    pub fn clock(&self) -> std::cell::Ref<'_, crate::clock::Clock> {
-        self.clock.borrow()
     }
 
     /// Undo the last widget-level edit. Returns true when something was undone.
@@ -742,7 +778,7 @@ impl canvas::Program<Message> for Program {
 
     fn mouse_interaction(
         &self,
-        _state: &Self::State,
+        state: &Self::State,
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> mouse::Interaction {
@@ -750,8 +786,26 @@ impl canvas::Program<Message> for Program {
         // Das lassen wir so, damit der Cursor sich nur ändert, wenn die Maus 
         // wirklich über dem jeweiligen Widget schwebt.
         if cursor.is_over(bounds) {
+            // Contextual trim cursor: over an event's start/end handle the
+            // pointer becomes a horizontal resize (Logic Pro behaviour).
+            if let Some(cursor) = cursor.position() {
+            let screen = crate::geom::ScreenPoint::new(cursor.x, cursor.y);
+                match self.current_tool() {
+                    Tool::Grab | Tool::Select => {
+                        if self.resize_edge_at(state, screen).is_some() {
+                            return mouse::Interaction::ResizingHorizontally;
+                        }
+                    }
+                    Tool::Move | Tool::Scale | Tool::Stretch => {
+                        if self.resize_edge_at(state, screen).is_some() {
+                            return mouse::Interaction::ResizingHorizontally;
+                        }
+                    }
+                    _ => {}
+                }
+            }
             match self.current_tool() {
-                Tool::Grab => mouse::Interaction::Grabbing,
+                Tool::Grab => mouse::Interaction::Grab,
                 Tool::Select => mouse::Interaction::default(),
                 Tool::Pen | Tool::Draw | Tool::Line | Tool::Curve => {
                     mouse::Interaction::Crosshair

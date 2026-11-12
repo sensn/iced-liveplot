@@ -983,28 +983,27 @@ fn draw_region_body(
             }
         }
         // Resize handles on start/end edges for span regions (MIDI notes,
-        // audio clips, loop): small white squares visible when hovered or
-        // selected — the Scale/Stretch tools drag them.
+        // audio clips, loop). Logic Pro style: the strips span the FULL height
+        // of the event and extend a few pixels outside it, so they are easy to
+        // grab; they are only drawn once the event is selected (which is when
+        // trimming is possible).
         let has_edges = matches!(
             region.kind,
             crate::region::RegionKind::MidiNote { .. }
                 | crate::region::RegionKind::AudioRegion { .. }
                 | crate::region::RegionKind::Loop { .. }
         );
-        if has_edges {
-            // Always visible so users can discover Scale/Stretch dragging;
-            // highlighted when the region is selected.
-            let handle_w = 4.0;
-            let handle_h = clipped_bounds.height().min(14.0).max(8.0);
-            let handle_color = if region.selected {
-                SerializableColor::new(1.0, 0.9, 0.4, 1.0) // bright yellow when selected
-            } else {
-                SerializableColor::new(1.0, 1.0, 1.0, 0.55) // translucent white
-            }.to_iced();
+        if has_edges && region.selected {
+            let top = clipped_bounds.min.y;
+            let bottom = clipped_bounds.max.y;
+            // Wider than before (8px + 2px outside) and full event height.
+            let handle_w = 6.0;
+            let margin = 2.0;
+            let handle_color = SerializableColor::new(1.0, 0.85, 0.25, 1.0).to_iced();
             // Start handle
             let start_handle = ScreenRect::new(
-                ScreenPoint::new(clipped_bounds.min.x - 1.0, (clipped_bounds.min.y + clipped_bounds.max.y) / 2.0 - handle_h / 2.0),
-                ScreenPoint::new(clipped_bounds.min.x + handle_w, (clipped_bounds.min.y + clipped_bounds.max.y) / 2.0 + handle_h / 2.0),
+                ScreenPoint::new(clipped_bounds.min.x - margin, top),
+                ScreenPoint::new(clipped_bounds.min.x + handle_w, bottom),
             );
             render.push(RenderCommand::Rect {
                 rect: start_handle,
@@ -1017,8 +1016,8 @@ fn draw_region_body(
             });
             // End handle
             let end_handle = ScreenRect::new(
-                ScreenPoint::new(clipped_bounds.max.x - handle_w, (clipped_bounds.min.y + clipped_bounds.max.y) / 2.0 - handle_h / 2.0),
-                ScreenPoint::new(clipped_bounds.max.x + 1.0, (clipped_bounds.min.y + clipped_bounds.max.y) / 2.0 + handle_h / 2.0),
+                ScreenPoint::new(clipped_bounds.max.x - handle_w, top),
+                ScreenPoint::new(clipped_bounds.max.x + margin, bottom),
             );
             render.push(RenderCommand::Rect {
                 rect: end_handle,
