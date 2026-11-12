@@ -247,9 +247,49 @@ pub enum ToolEvent {
     /// Rubber-band selection finished: all regions intersecting the
     /// data-space rect should be selected.
     BoxSelect { x0: f64, x1: f64, y0: f64, y1: f64 },
+    /// A model-level MIDI edit (index based, rebuild-safe).
+    Midi(MidiEdit),
     /// Log an informational message (for status display).
     Notify(String),
 }
+
+/// A set of MIDI notes a tool wants to edit (group selection).
+///
+/// Carries the **model indices** of the notes so the host can apply the edit
+/// without depending on region ids (which change on every rebuild).
+#[derive(Debug, Clone, Default)]
+pub struct NoteTargets {
+    /// Indices into the host's active track note list.
+    pub indices: Vec<usize>,
+}
+
+/// A tool edit expressed with model-level MIDI coordinates.
+///
+/// The widget resolves regions to their data-space coordinates and lets the
+/// host translate them back to its own model; carrying ticks/pitches avoids
+/// fragile region-id bookkeeping across model rebuilds.
+#[derive(Debug, Clone)]
+pub enum MidiEdit {
+    /// Insert a note at the given ticks/pitch.
+    Insert { pitch: u8, velocity: u8, start_tick: u64, end_tick: u64 },
+    /// Move the notes identified by `NoteTargets` by a tick/pitch delta.
+    Move { targets: NoteTargets, dt_ticks: i64, dy_semitones: i8 },
+    /// Resize an edge of the notes identified by `NoteTargets`.
+    Resize { targets: NoteTargets, edge: ResizeEdge, tick: u64 },
+    /// Delete the notes identified by `NoteTargets`.
+    Delete { targets: NoteTargets },
+    /// Split the notes at the given tick (only those containing it).
+    Split { targets: NoteTargets, tick: u64 },
+    /// Select all notes in the active track.
+    SelectAll,
+    /// Clear the selection.
+    ClearSelection,
+    /// Quantize the targets (or the whole track when empty) to the grid.
+    Quantize { targets: NoteTargets },
+    /// Transpose the targets (or the whole track when empty).
+    Transpose { targets: NoteTargets, semitones: i8 },
+    /// Set the velocity of the targets (or the whole track when empty).
+    Velocity { targets: NoteTargets, velocity: u8 },}
 
 /// Which edge of a region is being resized.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

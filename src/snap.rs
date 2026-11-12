@@ -233,6 +233,20 @@ pub struct SnapEngine {
 }
 
 impl SnapEngine {
+    
+    /// Snap a pure time position (seconds) to the configured grid.
+    ///
+    /// Returns `None` when snapping is disabled or no grid is configured.
+    pub fn snap_position_seconds(&self, seconds: f64) -> Option<f64> {
+        if !self.config.enabled {
+            return None;
+        }
+        let grid = self.config.grid.as_ref()?;
+        let beat = 60.0 / 120.0; // default tempo; tempo-aware snapping uses snap()
+        let _ = beat;
+        Some(grid.snap_time(seconds, 120.0))
+    }
+
     pub fn new(config: SnapConfig) -> Self {
         Self {
             config,

@@ -170,19 +170,77 @@ impl ToolGesture {
     }
 }
 
+/// The in-progress gesture of the Move / Scale / Stretch tools.
+///
+/// DAW piano-roll semantics:
+/// * a drag **only** starts when the press lands on a region (event);
+/// * pressing empty space does nothing (no phantom move);
+/// * the grabbed offset is remembered per region so the whole selection
+///   moves *with* the cursor, regardless of where inside the event the user
+///   pressed;
+/// * grabbing within a few pixels of an edge switches to resizing that edge
+///   (Scale = start, Stretch = end).
+#[derive(Debug, Clone)]
+pub struct MoveGesture {
+    /// The region that was pressed (and whose edges were tested).
+    pub primary: Option<crate::region::RegionId>,
+    /// Data-space point of the press.
+    pub grab: crate::geom::Point,
+    /// Data-space point of the current drag position.
+    pub current: crate::geom::Point,
+    /// Edge grabbed, if any (resize instead of move).
+    pub edge: Option<super::ResizeEdge>,
+    /// All regions participating in the gesture (primary + box-selection).
+    /// Per-region grab offsets are stored alongside so every event keeps its
+    /// relative distance to the cursor.
+    pub targets: Vec<(crate::region::RegionId, f64, f64)>,
+    /// True while the gesture is live.
+    pub active: bool,
+}
+
+impl Default for MoveGesture {
+    fn default() -> Self {
+        Self {
+            primary: None,
+            grab: crate::geom::Point::new(0.0, 0.0),
+            current: crate::geom::Point::new(0.0, 0.0),
+            edge: None,
+            targets: Vec::new(),
+            active: false,
+        }
+    }
+}
+
+impl MoveGesture {
+    fn clear(&mut self) {
+        self.active = false;
+        self.primary = None;
+        self.edge = None;
+        self.targets.clear();
+    }
+
+    /// Screen-space X travel of the current gesture, in data units.
+    pub fn dx(&self) -> f64 {
+        self.current.x - self.grab.x
+    }
+
+    /// Screen-space Y travel of the current gesture, in data units.
+    pub fn dy(&self) -> f64 {
+        self.current.y - self.grab.y
+    }
+}
+
 /// Tool state machine
 pub struct ToolState {
     pub current_tool: Tool,
     pub gesture: ToolGesture,
     pub last_cursor: Option<crate::geom::ScreenPoint>,
-    /// (region id, grab x, grab y) while a Move/Resize drag is in progress.
-    pub move_gesture: Option<(crate::region::RegionId, f64, f64)>,
-    /// Regions selected via box-select — group edits (move/resize) apply to
-    /// all of them.
+    /// Live Move/Scale/Stretch gesture (see [`MoveGesture`]).
+    pub drag_move: MoveGesture,
+    /// Regions flagged selected in the plot model (box-select result).
+    /// Kept as a cache for the widget's own checks; the plot model is the
+    /// authority and is re-read when a gesture starts.
     pub selected_regions: Vec<crate::region::RegionId>,
-    /// While a Move drag is active: edge grabbed (Some) → drag resizes that
-    /// edge instead of moving.
-    pub move_edge: Option<super::ResizeEdge>,
 }
 
 impl Default for ToolState {
@@ -191,9 +249,8 @@ impl Default for ToolState {
             current_tool: Tool::Grab,
             gesture: ToolGesture::None,
             last_cursor: None,
-            move_gesture: None,
+            drag_move: MoveGesture::default(),
             selected_regions: Vec::new(),
-            move_edge: None,
         }
     }
 }

@@ -137,6 +137,11 @@ enum Message {
     Plot(PlotMessage),
 }
 
+/// Seconds → MIDI ticks at the current tempo (float tempo helper).
+fn sec_to_ticks_float(seconds: f64) -> u64 {
+    (seconds * 124.0 / 60.0 * PPQ as f64).round() as u64
+}
+
 /// Seconds → MIDI ticks at `tempo` BPM with PPQ resolution.
 fn sec_to_ticks(seconds: f64, tempo: f64) -> u64 {
     let beats = seconds * tempo / 60.0;
@@ -193,24 +198,12 @@ struct SequencerApp {
 enum ToolEvent {
     /// Insert a MIDI note (pen tool in MIDI domain).
     Note { pitch: u8, velocity: u8, start: f64, duration: f64 },
-    /// Move a region by a time/pitch delta (seconds / semitones).
-    Move {
-        region: iced_liveplot::region::RegionId,
-        dt: f64,
-        dy: i8,
-    },
-    /// Resize a region edge to a new time.
-    Resize {
-        region: iced_liveplot::region::RegionId,
-        edge: iced_liveplot::widget::ResizeEdge,
-        time: f64,
-    },
-    /// Delete a region (eraser).
+    /// A model-level MIDI edit (index based, rebuild-safe).
+    Midi(iced_liveplot::widget::MidiEdit),
+    /// Delete a region (eraser, non-MIDI path).
     Delete { region: iced_liveplot::region::RegionId },
     /// Box-select the x/y range.
     BoxSelect { x0: f64, x1: f64, y0: f64, y1: f64 },
-    /// Split the region at `time` (Split tool).
-    Split { region: iced_liveplot::region::RegionId, time: f64 },
     /// A status message from the widget.
     Notify(String),
 }
@@ -330,38 +323,40 @@ impl SequencerApp {
         // Preserve the current viewport so rebuilding after a tool click never
         // resets the user's pan/zoom.
         let keep = self.program.plot().viewport();
+        let tempo = self.tempo;
         let mut regions: Vec<DataRegion> = self.sequence.tracks[active]
             .notes
             .iter()
-            .map(|note| Self::note_region(note, style))
+            .enumerate()
+            .map(|(index, note)| Self::note_region_at(note, style, index))
             .collect();
-        // Re-apply the box-selection AFTER regenerating regions, so group edits
-        // (move/resize/erase/split) survive the rebuild. Region ids change on
-        // regeneration, so match by (pitch, start tick, end tick) instead.
+
+        // ---- SELECTION: re-apply by MODEL IDENTITY (pitch/ticks) ----
+        // Region ids change on every rebuild, so the selection is re-derived
+        // from the *note* each previously selected region pointed at.
         let wanted: Vec<MidiNote> = self
             .selection
             .iter()
             .filter_map(|id| self.selected_note_for_region(*id))
             .collect();
         self.selection.clear();
-        let tempo = self.tempo;
         for region in &mut regions {
-            let RegionKind::MidiNote { pitch, velocity, start, end, .. } = &region.kind else {
+            let RegionKind::MidiNote { pitch, velocity, start, end, channel } = &region.kind else {
                 continue;
             };
-            let start_tick = sec_to_ticks(*start, tempo);
-            let end_tick = sec_to_ticks(*end, tempo);
             let hit = wanted.iter().any(|n| {
                 n.pitch == *pitch
                     && n.velocity == *velocity
-                    && n.start_tick == start_tick
-                    && n.end_tick == end_tick
+                    && n.channel == *channel
+                    && n.start_tick == sec_to_ticks(*start, tempo)
+                    && n.end_tick == sec_to_ticks(*end, tempo)
             });
             if hit {
                 region.selected = true;
                 self.selection.push(region.id);
             }
         }
+
         let plot = Self::build_plot(active, regions, keep);
         self.program = Program::new(plot);
         self.program.set_domain(self.domain);
@@ -370,91 +365,180 @@ impl SequencerApp {
         self.program.set_snap_engine(self.snap_engine.clone());
         let tpb = self.sequence.ticks_per_beat as u32;
         self.program.set_ticks_per_beat(tpb);
-        self.program.set_beats_per_bar(self.sequence.time_signature.0 as u32);
+        self.program
+            .set_beats_per_bar(self.sequence.time_signature.0 as u32);
         self.program.set_time_axis(self.time_axis);
+        // Keep the playhead position across the rebuild.
+        let playhead = self.playhead_position();
+        self.program.set_playhead_ticks(playhead);
         self.register_tool_handler();
         self.revision += 1;
     }
 
-    /// Register the widget→app tool event pipe. The widget callback cannot
-    /// reach `&mut self`, so events land in a shared buffer that `update`
-    /// drains into model mutations.
-    fn register_tool_handler(&self) {
-        let pending = self.pending_tool_events.clone();
+    /// Track-level selection: every note of the active track.
+    fn select_all_track(&mut self) {
+        self.selection = self.active_regions().iter().map(|r| r.id).collect();
+        self.program.with_plot_mut(|plot| {
+            for region in plot.regions_mut() {
+                region.selected = true;
+            }
+        });
+        let count = self.selection.len();
+        self.status = format!("Selected all {} notes of track {}", count, self.active + 1);
+        self.program.request_redraw();
+    }
+
+    /// NOTE: model index of a region id — the canonical mapping used by every
+    /// tool handler. Region ids are ephemeral; `note_index` is stable.
+    fn model_index_of(&self, region_id: iced_liveplot::region::RegionId) -> Option<usize> {
         self.program
-            .set_tool_event_handler(std::rc::Rc::new(move |event| {
-                let mut buf = pending.borrow_mut();
-                use iced_liveplot::widget::{ResizeEdge, ToolEvent as TE};
-                match event {
-                    TE::InsertMidiNote { pitch, velocity, start, duration } => {
-                        buf.push(ToolEvent::Note { pitch, velocity, start, duration });
-                    }
-                    TE::InsertAudioClip { start, duration } => {
-                        buf.push(ToolEvent::Notify(format!("Audio clip {:.2}s+{:.2}s", start, duration)));
-                    }
-                    TE::InsertAutomationPoint { time, value } => {
-                        buf.push(ToolEvent::Notify(format!("Automation {:.2}s={:.2}", time, value)));
-                    }
-                    TE::MoveRegion { region, dt, dy } => {
-                        buf.push(ToolEvent::Move { region, dt, dy });
-                    }
-                    TE::ResizeRegion { region, edge, time } => {
-                        buf.push(ToolEvent::Resize { region, edge, time });
-                    }
-                    TE::DeleteRegion { region } => {
-                        buf.push(ToolEvent::Delete { region });
-                    }
-                    TE::BoxSelect { x0, x1, y0, y1 } => {
-                        buf.push(ToolEvent::BoxSelect { x0, x1, y0, y1 });
-                    }
-                    TE::SplitRegion { region, time } => {
-                        buf.push(ToolEvent::Split { region, time });
-                    }
-                    TE::Notify(msg) => {
-                        buf.push(ToolEvent::Notify(msg));
-                    }
-                    TE::DeletePoint { .. } | TE::InsertPoint { .. } => {
-                        // Only meaningful in other domains; MIDI uses notes.
-                        let _ = Domain::Midi;
-                    }
-                    _ => {}
-                }
-                true
-            }));
+            .plot()
+            .regions()
+            .iter()
+            .find(|r| r.id == region_id)
+            .and_then(|r| r.metadata.get("note_index").and_then(|v| v.as_u64()))
+            .map(|i| i as usize)
     }
 
-    /// Regions of the active track (used for selection restore).
-    fn active_regions(&self) -> Vec<DataRegion> {
-        self.program.plot().regions().to_vec()
+    // ========================================================================
+    // Selection & track-level edit commands (buttons / keys)
+    // ========================================================================
+
+    /// Current selection as model indices (empty when nothing is selected).
+    fn selection_indices(&self) -> Vec<usize> {
+        let track_len = self.sequence.tracks[self.active].notes.len();
+        self.target_indices(None, track_len)
     }
 
-    fn series_id_for_active(&self) {
-        let _ = self.program.plot().series().first();
+    /// Delete the current selection (track-level when nothing is selected).
+    fn delete_selection(&mut self) {
+        let track_len = self.sequence.tracks[self.active].notes.len();
+        let mut indices = self.selection_indices();
+        if indices.is_empty() {
+            // No selection → the whole track (matches "Delete All").
+            indices = (0..track_len).collect();
+        }
+        indices.sort_unstable_by(|a, b| b.cmp(a));
+        let mut removed = 0;
+        for index in indices {
+            if index < self.sequence.tracks[self.active].notes.len() {
+                self.sequence.tracks[self.active].notes.remove(index);
+                removed += 1;
+            }
+        }
+        self.reset_selection();
+        self.status = format!("Deleted {} note(s)", removed);
+        self.rebuild_plot();
     }
 
-    /// Convert a `MidiNote` into a render region, colored by velocity.
-    fn note_region(note: &MidiNote, style: &PianoRollStyle) -> DataRegion {
-        let start = MidiNote::tick_to_seconds_static(note.start_tick, PPQ, 124.0);
-        let end = MidiNote::tick_to_seconds_static(note.end_tick, PPQ, 124.0);
-        let mut region = DataRegion::midi_note(note.pitch, note.velocity, note.channel, start, end);
-        // Color by velocity using the piano roll gradient
-        let t = (note.velocity as f32 / 127.0) * (style.velocity_gradient.len() - 1) as f32;
-        let idx = (t.round() as usize).min(style.velocity_gradient.len() - 1);
-        region.style.fill = Some(style.velocity_gradient[idx]);
-        region.style.stroke = Some(style.note_stroke);
-        region
+    /// Copy the selection into the model clipboard (cross-track).
+    fn copy_selection(&mut self) {
+        let indices = self.selection_indices();
+        if indices.is_empty() {
+            self.status = "Nothing to copy — select notes first".into();
+            return;
+        }
+        let notes = &self.sequence.tracks[self.active].notes;
+        self.clipboard = indices
+            .iter()
+            .filter_map(|i| notes.get(*i).copied())
+            .collect();
+        self.status = format!("Copied {} note(s)", self.clipboard.len());
     }
+
+    /// Cut = copy + delete.
+    fn cut_selection(&mut self) {
+        self.copy_selection();
+        self.delete_selection();
+        self.status = format!("Cut {} note(s) to clipboard", self.clipboard.len());
+        self.rebuild_plot();
+    }
+
+    /// Paste the clipboard at the playhead into the active track.
+    fn paste_clipboard(&mut self) {
+        if self.clipboard.is_empty() {
+            self.status = "Clipboard empty".into();
+            return;
+        }
+        let clip_start = self.clipboard.iter().map(|n| n.start_tick).min().unwrap_or(0);
+        // Snap the target position when snapping is enabled: with snap OFF the
+        // notes land at the EXACT playhead position; with snap ON they land on
+        // the nearest grid line.
+        let playhead = if self.snap_enabled {
+            self.snap_engine
+                .snap_position_seconds(self.playhead_seconds())
+                .map(sec_to_ticks_float)
+                .unwrap_or_else(|| self.program.playhead_ticks())
+        } else {
+            self.program.playhead_ticks()
+        };
+        let offset = playhead.saturating_sub(clip_start);
+        let shifted: Vec<MidiNote> = self
+            .clipboard
+            .iter()
+            .map(|n| MidiNote::new(n.pitch, n.velocity, n.channel, n.start_tick + offset, n.end_tick + offset))
+            .collect();
+        self.sequence.paste_notes(self.active, &shifted, 0);
+        self.status = format!(
+            "Pasted {} note(s) into track {} at tick {} (playhead)",
+            self.clipboard.len(),
+            self.active + 1,
+            playhead
+        );
+        self.rebuild_plot();
+    }
+
+    /// Quantize the selection (or the whole track when nothing is selected).
+    fn quantize_track(&mut self) {
+        self.apply_midi_edit(iced_liveplot::widget::MidiEdit::Quantize {
+            targets: iced_liveplot::widget::NoteTargets { indices: Vec::new() },
+        });
+    }
+
+    /// Transpose the selection (or the whole track when nothing is selected).
+    fn transpose_track(&mut self, semitones: i8) {
+        self.apply_midi_edit(iced_liveplot::widget::MidiEdit::Transpose {
+            targets: iced_liveplot::widget::NoteTargets { indices: Vec::new() },
+            semitones,
+        });
+    }
+
+    /// Set the velocity of the selection (or the whole track).
+    fn set_selected_velocity(&mut self, velocity: i64) {
+        self.apply_midi_edit(iced_liveplot::widget::MidiEdit::Velocity {
+            targets: iced_liveplot::widget::NoteTargets { indices: Vec::new() },
+            velocity: velocity.clamp(0, 127) as u8,
+        });
+    }
+
+    /// Select all notes of the active track.
+    fn select_all_regions(&mut self) {
+        self.select_all_track();
+    }
+
+    /// Clear the current selection.
+    fn clear_selection(&mut self) {
+        self.reset_selection();
+        self.program.request_redraw();
+        self.status = "Selection cleared".into();
+    }
+
+    // ========================================================================
+    // Model configuration
+    // ========================================================================
 
     /// Apply the current snap configuration to the engine (and mirror into
     /// the widget program).
     fn apply_snap_config(&mut self) {
-        let beat = 60.0 / self.tempo;
+        let (num, den) = self.sequence.time_signature;
+        // One beat (in the denominator's unit) at the current tempo.
+        let beat_unit = 60.0 / self.tempo * (4.0 / den as f64);
         // division per bar: 4 = quarter, 8 = eighth, 16 = 16th, 32 = 32nd
-        let sixteenth = beat / 4.0;
+        let sixteenth = beat_unit / 4.0;
         let step = sixteenth * (16 / self.snap_division.max(1)) as f64;
         *self.snap_engine.config_mut() = SnapConfig {
             enabled: self.snap_enabled,
-            grid: Some(GridSpec::seconds(step)),
+            grid: Some(GridSpec::seconds(step.max(1e-4))),
             time_base: TimeBase::Beats,
             threshold_px: 12.0,
             snap_to_regions: false,
@@ -467,32 +551,31 @@ impl SequencerApp {
 
     fn reset_selection(&mut self) {
         self.selection.clear();
+        self.program.with_plot_mut(|plot| {
+            for region in plot.regions_mut() {
+                region.selected = false;
+            }
+        });
+    }
+
+    /// The playhead in seconds.
+    fn playhead_seconds(&self) -> f64 {
+        self.program.playhead_seconds()
+    }
+
+    /// Ticks → seconds at the current tempo.
+    fn ticks_to_sec(&self, ticks: u64) -> f64 {
+        MidiNote::tick_to_seconds_static(ticks, PPQ, self.tempo)
     }
 
     fn note_length_seconds(&self) -> f64 {
         self.note_length.seconds(self.tempo)
     }
 
-    /// Seconds → ticks.
-    fn sec_to_ticks(&self, seconds: f64) -> u64 {
-        let beats = seconds * self.tempo / 60.0;
-        (beats * PPQ as f64).round() as u64
-    }
-
-    /// Ticks → seconds.
-    fn ticks_to_sec(&self, ticks: u64) -> f64 {
-        MidiNote::tick_to_seconds_static(ticks, PPQ, self.tempo)
-    }
-
-    /// The note under the playhead using the region list (by sorted find).
-    fn active_track(&mut self) -> &mut MidiTrack {
-        &mut self.sequence.tracks[self.active]
-    }
-
     /// Seed a demo pattern (chords + bass + drums).
     fn seed_demo(sequence: &mut MidiSequence) {
         let chord_roots: [(u8, i8); 4] = [(0, 0), (5, 2), (7, 4), (5, -3)]; // C, F, G, Am
-        // Track 1: chords (triads), 4 bars
+        // Track 1: chords (triads), 8 bars
         {
             let track = &mut sequence.tracks[0];
             for bar in 0..(BARS as u64 / 2) {
@@ -517,7 +600,13 @@ impl SequencerApp {
             for bar in 0..(BARS as u64 / 4) {
                 for beat in 0..4u64 {
                     let start = (bar * 4 + beat) * PPQ;
-                    track.add_note(MidiNote::new(36 + (beat as u8 % 4) * 5, 100, 1, start, start + PPQ / 2));
+                    track.add_note(MidiNote::new(
+                        36 + (beat as u8 % 4) * 5,
+                        100,
+                        1,
+                        start,
+                        start + PPQ / 2,
+                    ));
                 }
             }
         }
@@ -544,240 +633,99 @@ impl SequencerApp {
             }
         }
     }
-}
 
-impl SequencerApp {
-    /// Insert a note into the model at the given tick/pitch and rebuild.
-    fn insert_note(&mut self, start_tick: u64, end_tick: u64, pitch: u8, velocity: u8) {
-        let channel = self.sequence.tracks[self.active].channel;
-        let note = MidiNote::new(pitch, velocity, channel, start_tick, end_tick.max(start_tick + 1));
-        self.sequence.tracks[self.active].add_note(note);
-        self.after_edit(format!("Inserted {} note", midi_note_name(pitch)));
+    /// The playhead position mirrored into the widget.
+    fn playhead_position(&self) -> u64 {
+        self.program.playhead_ticks()
     }
 
-    fn after_edit(&mut self, msg: String) {
-        self.status = msg;
-        self.rebuild_plot();
+    // ========================================================================
+    // Tool event pipeline (single entry point for every tool edit)
+    // ========================================================================
+
+    /// Regions of the active track (the current mirror of the model).
+    fn active_regions(&self) -> Vec<DataRegion> {
+        self.program.plot().regions().to_vec()
     }
 
-    /// Clip a MIDI note under the cursor. Uses region ids matching
-    /// note index by ordering (both are sorted by start tick).
-    fn note_index_of_region(&self, region_id: RegionId) -> Option<usize> {
-        let regions = self.active_regions();
-        let pos = regions.iter().position(|r| r.id == region_id)?;
-        // Regions are regenerated in note order; both sorted by start tick.
-        Some(pos)
+    /// Convert a `MidiNote` into a render region, colored by velocity.
+    ///
+    /// `index` is the note's position in the active track's `notes` vector —
+    /// written into `region.metadata["note_index"]` so tools address notes by
+    /// MODEL INDEX (stable across plot rebuilds) instead of ephemeral
+    /// region ids.
+    fn note_region_at(note: &MidiNote, style: &PianoRollStyle, index: usize) -> DataRegion {
+        let start = MidiNote::tick_to_seconds_static(note.start_tick, PPQ, 124.0);
+        let end = MidiNote::tick_to_seconds_static(note.end_tick, PPQ, 124.0);
+        let mut region = DataRegion::midi_note(note.pitch, note.velocity, note.channel, start, end);
+        // Color by velocity using the piano roll gradient.
+        let t = (note.velocity as f32 / 127.0) * (style.velocity_gradient.len() - 1) as f32;
+        let idx = (t.round() as usize).min(style.velocity_gradient.len() - 1);
+        region.style.fill = Some(style.velocity_gradient[idx]);
+        region.style.stroke = Some(style.note_stroke);
+        region
+            .metadata
+            .insert("note_index".to_string(), serde_json::json!(index));
+        region
     }
 
-    fn delete_selection(&mut self) {
-        if self.selection.is_empty() {
-            self.status = "Nothing selected".into();
-            return;
-        }
-        // Drop the plot-side selection flags too (keeps handles in sync).
-        self.program.with_plot_mut(|plot| {
-            for region in plot.regions_mut() {
-                region.selected = false;
-            }
-        });
-        let count = self.selection.len();
-        // Capture regions before removing (for undo)
-        let regions = self.active_regions();
-        let removed: Vec<DataRegion> = regions
-            .iter()
-            .filter(|r| self.selection.contains(&r.id))
-            .cloned()
-            .collect();
-        // Remove from model
-        let mut removed_indices: Vec<usize> = self
-            .selection
-            .iter()
-            .filter_map(|id| self.note_index_of_region(*id))
-            .collect();
-        removed_indices.sort_unstable_by(|a, b| b.cmp(a)); // descending
-        for idx in removed_indices {
-            if idx < self.sequence.tracks[self.active].notes.len() {
-                self.sequence.tracks[self.active].notes.remove(idx);
-            }
-        }
-        self.program.execute_action(std::sync::Arc::new(RemoveRegions { removed }));
-        self.reset_selection();
-        self.after_edit(format!("Deleted {} notes", count));
-    }
-
-    fn select_all_track(&mut self) {
-        self.selection = self.active_regions().iter().map(|r| r.id).collect();
-        self.status = format!("Selected all {} notes", self.selection.len());
-        self.program.request_redraw();
-    }
-
-    /// Copy the selected notes into the model clipboard (cross-track).
-    fn copy_selection(&mut self) {
-        let ids: Vec<_> = self.selection.clone();
-        if ids.is_empty() {
-            self.status = "Nothing to copy — box-select some notes first".into();
-            return;
-        }
-        let regions = self.active_regions();
-        let tempo = self.tempo;
-        let notes: Vec<MidiNote> = regions
-            .iter()
-            .filter(|r| ids.contains(&r.id))
-            .filter_map(|r| match &r.kind {
-                RegionKind::MidiNote { pitch, velocity, channel, start, end } => Some(MidiNote::new(
-                    *pitch,
-                    *velocity,
-                    *channel,
-                    sec_to_ticks(*start, tempo),
-                    sec_to_ticks(*end, tempo),
-                )),
-                _ => None,
-            })
-            .collect();
-        self.clipboard = notes;
-        self.status = format!("Copied {} note(s) to clipboard", self.clipboard.len());
-    }
-
-    /// Cut = copy + delete.
-    fn cut_selection(&mut self) {
-        if self.selection.is_empty() {
-            self.status = "Nothing to cut".into();
-            return;
-        }
-        self.copy_selection();
-        self.delete_selection();
-        self.status = format!("Cut {} note(s) to clipboard", self.clipboard.len());
-    }
-
-    /// Paste the clipboard into the active track AT THE PLAYHEAD position.
-    /// Copied notes keep their relative offsets from the clipboard's start, so
-    /// a pattern pasted over a bar lands where the playhead is.
-    fn paste_clipboard(&mut self) {
-        if self.clipboard.is_empty() {
-            self.status = "Clipboard empty — copy some notes first".into();
-            return;
-        }
-        let clip_start = self.clipboard.iter().map(|n| n.start_tick).min().unwrap_or(0);
-        let playhead = self.program.playhead_ticks();
-        // Shift so the earliest copied note starts exactly at the playhead.
-        let offset = playhead.saturating_sub(clip_start);
-        // Compensate the per-note shift `paste_notes` applies internally.
-        let shifted: Vec<MidiNote> = self
-            .clipboard
-            .iter()
-            .map(|n| MidiNote::new(
-                n.pitch,
-                n.velocity,
-                n.channel,
-                n.start_tick + offset,
-                n.end_tick + offset,
-            ))
-            .collect();
-        self.sequence.paste_notes(self.active, &shifted, 0);
-        self.program.set_playhead_ticks(playhead);
-        self.status = format!(
-            "Pasted {} note(s) into track {} at {} ticks (playhead)",
-            self.clipboard.len(),
-            self.active + 1,
-            playhead
-        );
-        self.rebuild_plot();
-    }
-
-    fn paste(&mut self) {
-        self.paste_clipboard();
-    }
-
-    /// Rewrite the model's note list from the plot's current regions for the
-    /// active track (used after paste / undo so the model stays the source of
-    /// truth on the next view() pass).
-    fn mirror_regions_to_model(&mut self) {
-        let regions = self.active_regions();
-        let tempo = self.tempo;
-        let sec_to_ticks = |s: f64| -> u64 {
-            let beats = s * tempo / 60.0;
-            (beats * PPQ as f64).round() as u64
-        };
-        let notes: Vec<MidiNote> = regions
-            .iter()
-            .filter_map(|r| match &r.kind {
-                RegionKind::MidiNote { pitch, velocity, channel, start, end } => Some(MidiNote::new(
-                    *pitch,
-                    *velocity,
-                    *channel,
-                    sec_to_ticks(*start),
-                    sec_to_ticks(*end),
-                )),
-                _ => None,
-            })
-            .collect();
-        self.sequence.tracks[self.active].notes = notes;
-    }
-
-    fn quantize_track(&mut self) {
-        let tempo = self.tempo;
-        let beat = 60.0 / tempo;
-        let step = (beat / 4.0) * (16 / self.snap_division.max(1)) as f64;
-        let beats = step * tempo / 60.0;
-        let grid_ticks = (beats * PPQ as f64).round() as u64;
-        self.active_track().quantize(grid_ticks, PPQ as u64, tempo, 1.0);
-        self.after_edit(format!("Quantized to 1/{}", self.snap_division));
-    }
-
-    fn transpose_track(&mut self, semitones: i8) {
-        self.active_track().transpose(semitones);
-        self.after_edit(format!("Transposed {:+} semitones", semitones));
-    }
-
-    fn set_selected_velocity(&mut self, velocity: i64) {
-        let velocity = velocity.clamp(0, 127) as u8;
-        if self.selection.is_empty() {
-            self.status = "Select notes first (box-select)".into();
-            return;
-        }
-        let regions = self.active_regions();
-        for id in &self.selection {
-            if let Some(pos) = regions.iter().position(|r| r.id == *id) {
-                let notes = &mut self.sequence.tracks[self.active].notes;
-                if let Some(note) = notes.get_mut(pos) {
-                    note.velocity = velocity;
+    /// Register the widget→app tool event pipe. `Program::new` starts WITHOUT
+    /// a handler, so this must run on every rebuild.
+    fn register_tool_handler(&self) {
+        let pending = self.pending_tool_events.clone();
+        self.program
+            .set_tool_event_handler(std::rc::Rc::new(move |event| {
+                let mut buf = pending.borrow_mut();
+                use iced_liveplot::widget::{MidiEdit, ResizeEdge, ToolEvent as TE};
+                match event {
+                    TE::Midi(edit) => {
+                        buf.push(ToolEvent::Midi(edit));
+                    }
+                    TE::InsertMidiNote { pitch, velocity, start, duration } => {
+                        buf.push(ToolEvent::Note {
+                            pitch,
+                            velocity,
+                            start,
+                            duration,
+                        });
+                    }
+                    TE::DeleteRegion { region } => {
+                        buf.push(ToolEvent::Delete { region });
+                    }
+                    TE::BoxSelect { x0, x1, y0, y1 } => {
+                        buf.push(ToolEvent::BoxSelect { x0, x1, y0, y1 });
+                    }
+                    TE::Notify(msg) => buf.push(ToolEvent::Notify(msg)),
+                    _ => {}
                 }
-            }
-        }
-        self.after_edit(format!("Velocity set to {}", velocity));
+                true
+            }));
     }
-
-    // ========================================================================
-    // Tool event pipeline
-    // ========================================================================
 
     /// Apply the tool events queued by the widget since the last frame.
+    ///
+    /// Every branch goes through `self.target_indices()` which implements the
+    /// two-level edit model:
+    /// * **selection present** → edit the whole selection;
+    /// * **no selection** → edit the single event under the cursor;
+    /// * track-level actions (buttons/keys) pass `None` → whole track.
     fn drain_tool_events(&mut self) {
         let events: Vec<ToolEvent> = std::mem::take(&mut *self.pending_tool_events.borrow_mut());
         for event in events {
             match event {
                 ToolEvent::Note { pitch, velocity, start, duration } => {
-                    let start_tick = self.sec_to_ticks(start);
-                    let end_tick = self.sec_to_ticks(start + duration);
+                    let start_tick = sec_to_ticks(start, self.tempo);
+                    let end_tick = sec_to_ticks(start + duration, self.tempo);
                     let channel = self.sequence.tracks[self.active].channel;
-                    let note = MidiNote::new(
+                    self.sequence.tracks[self.active].add_note(MidiNote::new(
                         pitch,
                         velocity,
                         channel,
                         start_tick,
                         end_tick.max(start_tick + 1),
-                    );
-                    // Snapshot for undo: plot regions are regenerated, so we
-                    // capture the pre-state and add the new region as an action.
-                    let mut region = Self::note_region(&note, &self.roll_style);
-                    region.series = self.series_for_active();
-                    self.program
-                        .execute_action(std::sync::Arc::new(iced_liveplot::widget::actions::AddRegions {
-                            regions: vec![region],
-                        }));
-                    self.sequence.tracks[self.active].add_note(note);
+                    ));
                     self.status = format!(
-                        "Pen: inserted {} (vel {}) at {:.2}s len {}",
+                        "Pen: {} (vel {}) at {:.2}s, {}",
                         midi_note_name(pitch),
                         velocity,
                         start,
@@ -785,60 +733,197 @@ impl SequencerApp {
                     );
                     self.rebuild_plot();
                 }
-                ToolEvent::Move { region, dt, dy } => {
-                    self.tool_move_region(region, dt, dy);
-                }
-                ToolEvent::Resize { region, edge, time } => {
-                    self.tool_resize_region(region, edge, time);
-                }
+                ToolEvent::Midi(edit) => self.apply_midi_edit(edit),
                 ToolEvent::Delete { region } => {
-                    // Clicking a selected note erases the WHOLE selection;
-                    // otherwise just the note under the cursor.
-                    if self.selection.contains(&region) {
-                        let count = self.selection.len();
-                        let mut indices: Vec<usize> = self
-                            .selection
-                            .iter()
-                            .filter_map(|id| self.note_index_for_region(*id))
-                            .collect();
-                        indices.sort_unstable_by(|a, b| b.cmp(a));
-                        for idx in indices {
-                            if idx < self.sequence.tracks[self.active].notes.len() {
-                                self.sequence.tracks[self.active].notes.remove(idx);
-                            }
+                    if let Some(index) = self.model_index_of(region) {
+                        let notes = &mut self.sequence.tracks[self.active].notes;
+                        if index < notes.len() {
+                            notes.remove(index);
                         }
-                        self.selection.clear();
-                        self.status = format!("Erased {} selected note(s)", count);
-                        self.rebuild_plot();
-                    } else {
-                        self.tool_delete_region(region);
+                        self.status = format!("Erased note #{}", index);
                     }
-                }
-                ToolEvent::BoxSelect { x0, x1, y0, y1 } => {
-                    self.tool_box_select(x0, x1, y0, y1);
-                }
-                ToolEvent::Split { region, time } => {
-                    // If the clicked note is part of the selection, split every
-                    // selected note; otherwise split just the clicked one.
-                    let targets = if self.selection.contains(&region) {
-                        self.selection.clone()
-                    } else {
-                        vec![region]
-                    };
-                    let mut split_count = 0;
-                    for target in targets {
-                        if self.tool_split_region(target, time) {
-                            split_count += 1;
-                        }
-                    }
-                    self.status = format!("Split: {} note(s) at {:.2}s", split_count, time);
                     self.rebuild_plot();
                 }
-                ToolEvent::Notify(msg) => {
-                    self.status = msg;
+                ToolEvent::BoxSelect { x0, x1, y0, y1 } => self.tool_box_select(x0, x1, y0, y1),
+                ToolEvent::Notify(msg) => self.status = msg,
+            }
+        }
+    }
+
+    /// Resolve which model indices an edit applies to.
+    ///
+    /// `hit` is the index under the cursor (or `None` for track-level actions).
+    /// When a box-selection exists it always wins, so tools operate on the
+    /// selection exactly like commercial DAWs.
+    fn target_indices(&self, hit: Option<usize>, track_len: usize) -> Vec<usize> {
+        if self.selection.is_empty() {
+            return hit.map(|i| vec![i]).unwrap_or_default();
+        }
+        // Selection wins when there is one, otherwise fall back to the hit.
+        let mut out: Vec<usize> = Vec::new();
+        for id in &self.selection {
+            if let Some(index) = self.model_index_of(*id) {
+                if index < track_len && !out.contains(&index) {
+                    out.push(index);
                 }
             }
         }
+        if out.is_empty() {
+            hit.map(|i| vec![i]).unwrap_or_default()
+        } else {
+            out
+        }
+    }
+
+    /// Apply one model-level MIDI edit coming from a tool or a button.
+    fn apply_midi_edit(&mut self, edit: iced_liveplot::widget::MidiEdit) {
+        use iced_liveplot::widget::{MidiEdit, ResizeEdge};
+        let track_len = self.sequence.tracks[self.active].notes.len();
+        match edit {
+            MidiEdit::Move { targets, dt_ticks, dy_semitones } => {
+                let indices = self.target_indices(targets.indices.first().copied(), track_len);
+                let mut moved = 0;
+                let notes = &mut self.sequence.tracks[self.active].notes;
+                for index in indices {
+                    if index < track_len {
+                        let note = &mut notes[index];
+                        let start = note.start_tick as i64 + dt_ticks;
+                        let end = note.end_tick as i64 + dt_ticks;
+                        note.start_tick = start.max(0) as u64;
+                        note.end_tick = end.max(note.start_tick as i64 + 1) as u64;
+                        note.pitch = (note.pitch as i16 + dy_semitones as i16).clamp(0, 127) as u8;
+                        moved += 1;
+                    }
+                }
+                self.status = format!("Moved {} note(s) ({:+} ticks, {:+} st)", moved, dt_ticks, dy_semitones);
+            }
+            MidiEdit::Resize { targets, edge, tick } => {
+                let indices = self.target_indices(targets.indices.first().copied(), track_len);
+                let mut resized = 0;
+                let notes = &mut self.sequence.tracks[self.active].notes;
+                for index in indices {
+                    if index < track_len {
+                        let note = &mut notes[index];
+                        match edge {
+                            ResizeEdge::Start => {
+                                note.start_tick = tick.min(note.end_tick.saturating_sub(1));
+                            }
+                            ResizeEdge::End => {
+                                note.end_tick = tick.max(note.start_tick + 1);
+                            }
+                        }
+                        resized += 1;
+                    }
+                }
+                self.status = format!(
+                    "Resized {} edge of {} note(s) to tick {}",
+                    match edge {
+                        ResizeEdge::Start => "start",
+                        ResizeEdge::End => "end",
+                    },
+                    resized,
+                    tick
+                );
+            }
+            MidiEdit::Delete { targets } => {
+                let mut indices = self.target_indices(targets.indices.first().copied(), track_len);
+                indices.sort_unstable_by(|a, b| b.cmp(a));
+                let mut removed = 0;
+                let notes = &mut self.sequence.tracks[self.active].notes;
+                for index in indices {
+                    if index < notes.len() {
+                        notes.remove(index);
+                        removed += 1;
+                    }
+                }
+                self.selection.clear();
+                self.status = format!("Deleted {} note(s)", removed);
+            }
+            MidiEdit::Split { targets, tick } => {
+                let indices = self.target_indices(targets.indices.first().copied(), track_len);
+                let mut splits = 0;
+                // Insert in descending order so earlier indices stay valid.
+                let mut indices = indices;
+                indices.sort_unstable_by(|a, b| b.cmp(a));
+                let notes = &mut self.sequence.tracks[self.active].notes;
+                for index in indices {
+                    if index < notes.len() {
+                        let note = notes[index];
+                        if tick > note.start_tick && tick < note.end_tick {
+                            let left = MidiNote::new(note.pitch, note.velocity, note.channel, note.start_tick, tick);
+                            let right = MidiNote::new(note.pitch, note.velocity, note.channel, tick, note.end_tick);
+                            notes[index] = left;
+                            notes.insert(index + 1, right);
+                            splits += 1;
+                        }
+                    }
+                }
+                self.status = format!("Split {} note(s) at tick {}", splits, tick);
+            }
+            MidiEdit::SelectAll => self.select_all_track(),
+            MidiEdit::ClearSelection => self.reset_selection(),
+            MidiEdit::Quantize { targets } => {
+                let indices = self.target_indices(targets.indices.first().copied(), track_len);
+                let indices = if indices.is_empty() {
+                    (0..track_len).collect::<Vec<_>>()
+                } else {
+                    indices
+                };
+                let notes = &mut self.sequence.tracks[self.active].notes;
+                let step = match self.note_length {
+                    NoteLength::Sixteenth => PPQ as u64 / 4,
+                    NoteLength::Eighth => PPQ as u64 / 2,
+                    NoteLength::Quarter => PPQ as u64,
+                    NoteLength::Half => PPQ as u64 * 2,
+                    NoteLength::Whole => PPQ as u64 * 4,
+                };
+                for index in indices {
+                    if index < track_len {
+                        let note = &mut notes[index];
+                        note.start_tick = (note.start_tick / step.max(1)) * step.max(1);
+                        note.end_tick = note.end_tick.max(note.start_tick + 1);
+                    }
+                }
+                self.status = format!("Quantized to {} grid", self.note_length.label());
+            }
+            MidiEdit::Transpose { targets, semitones } => {
+                let indices = self.target_indices(targets.indices.first().copied(), track_len);
+                let indices = if indices.is_empty() {
+                    (0..track_len).collect::<Vec<_>>()
+                } else {
+                    indices
+                };
+                let notes = &mut self.sequence.tracks[self.active].notes;
+                for index in indices {
+                    if index < track_len {
+                        let note = &mut notes[index];
+                        note.pitch = (note.pitch as i16 + semitones as i16).clamp(0, 127) as u8;
+                    }
+                }
+                self.status = format!("Transposed by {:+} semitones", semitones);
+            }
+            MidiEdit::Velocity { targets, velocity } => {
+                let indices = self.target_indices(targets.indices.first().copied(), track_len);
+                let indices = if indices.is_empty() {
+                    (0..track_len).collect::<Vec<_>>()
+                } else {
+                    indices
+                };
+                let notes = &mut self.sequence.tracks[self.active].notes;
+                for index in indices {
+                    if index < track_len {
+                        notes[index].velocity = velocity;
+                    }
+                }
+                self.status = format!("Velocity set to {}", velocity);
+            }
+            MidiEdit::Insert { pitch, velocity, start_tick, end_tick } => {
+                let notes = &mut self.sequence.tracks[self.active].notes;
+                notes.push(MidiNote::new(pitch, velocity, 0, start_tick, end_tick));
+                self.status = format!("Inserted {}", midi_note_name(pitch));
+            }
+        }
+        self.rebuild_plot();
     }
 
     /// Resolve a selected region id back to its note (for rebuild restore).
@@ -1082,7 +1167,6 @@ impl SequencerApp {
             }
             Message::Undo => {
                 if self.program.undo() {
-                    self.mirror_regions_to_model();
                     self.status = "Undo".into();
                     self.rebuild_plot();
                 } else {
@@ -1091,7 +1175,6 @@ impl SequencerApp {
             }
             Message::Redo => {
                 if self.program.redo() {
-                    self.mirror_regions_to_model();
                     self.status = "Redo".into();
                     self.rebuild_plot();
                 } else {
@@ -1100,7 +1183,7 @@ impl SequencerApp {
             }
             Message::Copy => self.copy_selection(),
             Message::Cut => self.cut_selection(),
-            Message::Paste => self.paste(),
+            Message::Paste => self.paste_clipboard(),
             Message::DeleteSelection => {
                 self.delete_selection();
                 self.rebuild_plot();

@@ -18,8 +18,8 @@ use crate::view::Viewport;
 
 use super::hover::update_hover_target;
 use super::state::{ClickState, DragMode, DragState, LastClick, PlotUiState};
-use super::tools::{ToolGesture, ToolState};
-use super::{Message, Program, ResizeEdge, Tool, ToolEvent};
+use super::tools::{MoveGesture, ToolGesture, ToolState};
+use super::{Message, MidiEdit, NoteTargets, Program, ResizeEdge, Tool, ToolEvent};
 
 /// Scroll wheel line height in pixels (matches the GPUI backend default).
 const SCROLL_LINE_HEIGHT: f32 = 16.0;
@@ -345,8 +345,15 @@ fn handle_mouse_move(
     }
 
     // ---- TOOLS: feed move to active tool while dragging ----
-    let tool_dragging = state.drag.as_ref().is_some_and(|d| d.active);
+    // Selection/move/scale/stretch gestures live in the tool state (not in
+    // `state.drag`), so "dragging" means either an active region drag OR an
+    // active tool gesture (box select).
+    let drag_active = state.drag.as_ref().is_some_and(|d| d.active);
+    let gesture_active = program.with_tool_state(|ts| {
+        ts.drag_move.active || matches!(ts.gesture, super::tools::ToolGesture::Draw { .. })
+    });
     let tool = program.current_tool();
+    let tool_dragging = drag_active || gesture_active;
     if tool_dragging && hit_region == HitRegion::Plot && tool != Tool::Grab {
         run_tool_mouse(program, state, tool, pos, ToolPhase::Move);
         if matches!(tool, Tool::Draw | Tool::Select | Tool::Move | Tool::Scale | Tool::Stretch) {
@@ -704,163 +711,159 @@ pub(crate) fn run_tool_mouse(
         return;
     }
 
-    // ---- MOVE tool: press on a region, drag it, release commits MoveRegion.
-    // Grabbing within 6px of a region's start/end edge (the always-visible
-    // rectangles) switches the gesture into an edge resize instead.
-    // Pressing on empty space while a box-selection exists drags the WHOLE
-    // selection (dt from the press point).
-    if tool == Tool::Move {
+    // ---- MOVE / SCALE / STRETCH (model-index based, DAW semantics) ----
+    //
+    // A gesture starts ONLY when the press lands on a region — empty space
+    // never moves anything (panning stays with the Grab tool). The whole group
+    // of "pressed + box-selected" regions travels with the cursor; the delta
+    // is measured in data units, so where inside an event you press is
+    // irrelevant. Edits carry MODEL INDICES taken from region metadata
+    // (`note_index`), so the host can apply them after any rebuild without
+    // fragile region-id bookkeeping.
+    if matches!(tool, Tool::Move | Tool::Scale | Tool::Stretch) {
+        let forced_edge = match tool {
+            Tool::Scale => Some(ResizeEdge::Start),
+            Tool::Stretch => Some(ResizeEdge::End),
+            _ => None,
+        };
         match phase {
             ToolPhase::Down => {
-                let region = region_at(program, &transform, snapped_point);
-                // Nothing under the cursor but regions are selected? Grab the
-                // EARLIEST selected region and anchor the gesture at THAT
-                // region's start (not at the click point), so the group slides
-                // under the cursor instead of jumping by the click offset.
-                let (region, anchor_x) = match &region {
-                    Some(r) => {
-                        let anchor = r.time_range().map(|t| t.min).unwrap_or(snapped_point.x);
-                        (Some(r.clone()), anchor)
+                // Press must land on a region, otherwise the gesture is inert.
+                let Some(region) = region_at(program, &transform, snapped_point) else {
+                    return;
+                };
+                let primary = region.clone();
+                // Targets: the pressed region plus every selected region.
+                let mut targets: Vec<crate::region::DataRegion> = vec![primary.clone()];
+                for r in program.plot().regions().iter() {
+                    if r.selected && r.id != primary.id {
+                        targets.push(r.clone());
                     }
+                }
+                // Edge detection for the plain Move tool (±8 px). With a group
+                // an edge press becomes a group resize; a single target keeps
+                // plain move behaviour.
+                let edge = match forced_edge {
+                    Some(edge) => Some(edge),
                     None => {
-                        let selected = selected_regions(program);
-                        let picked = program
-                            .plot()
-                            .regions()
-                            .iter()
-                            .filter(|r| selected.contains(&r.id))
-                            .min_by(|a, b| {
-                                a.time_range()
-                                    .map(|t| t.min)
-                                    .partial_cmp(&b.time_range().map(|t| t.min))
-                                    .unwrap_or(std::cmp::Ordering::Equal)
-                            })
-                            .cloned();
-                        if let Some(r) = picked.as_ref() {
-                            let anchor = r.time_range().map(|t| t.min).unwrap_or(snapped_point.x);
-                            (picked, anchor)
-                        } else {
-                            (None, snapped_point.x)
+                        let edge_px = 8.0_f32;
+                        let span = transform.screen().width().max(1.0);
+                        let edge_data = f64::from(edge_px) / f64::from(span);
+                        let clicked_edge = primary.time_range().and_then(|t| {
+                            if (snapped_point.x - t.min) <= edge_data {
+                                Some(ResizeEdge::Start)
+                            } else if (t.max - snapped_point.x) <= edge_data {
+                                Some(ResizeEdge::End)
+                            } else {
+                                None
+                            }
+                        });
+                        match clicked_edge {
+                            Some(edge) if targets.len() > 1 => Some(edge),
+                            _ => None,
                         }
                     }
                 };
-                // Edge detection: convert 6 px to data units
-                let px6_data = 6.0 * (transform.data_span_x() / f64::from(transform.screen().width().max(1.0)));
-                let edge = region.as_ref().and_then(|r| {
-                    let tr = r.time_range()?;
-                    if (snapped_point.x - tr.min).abs() <= px6_data {
-                        Some(ResizeEdge::Start)
-                    } else if (tr.max - snapped_point.x).abs() <= px6_data {
-                        Some(ResizeEdge::End)
-                    } else {
-                        None
-                    }
-                });
+                let grab = snapped_point;
                 program.with_tool_state(|ts| {
-                    ts.move_gesture = region.map(|r| (r.id, anchor_x, snapped_point.y));
-                    ts.move_edge = edge;
-                    ts.gesture = ToolGesture::Drag {
-                        start: snapped_point,
-                        start_screen: screen,
-                        current: snapped_point,
-                        current_screen: screen,
+                    ts.drag_move = MoveGesture {
+                        primary: Some(primary.id),
+                        grab,
+                        current: grab,
+                        edge,
+                        targets: targets
+                            .iter()
+                            .filter_map(|r| r.time_range().map(|t| (r.id, t.min, t.max)))
+                            .collect(),
+                        active: true,
                     };
+                    ts.gesture = ToolGesture::None;
+                });
+            }
+            ToolPhase::Move => {
+                program.with_tool_state(|ts| {
+                    if ts.drag_move.active {
+                        ts.drag_move.current = snapped_point;
+                    }
                 });
             }
             ToolPhase::Up => {
-                let (held, edge) = program.with_tool_state(|ts| {
-                    let held = ts.move_gesture.take();
-                    let edge = ts.move_edge.take();
-                    ts.gesture = ToolGesture::None;
-                    (held, edge)
+                // `current` is updated by the move handler, but the release
+                // position is authoritative (the last motion event may be
+                // coalesced or skipped) — refresh it before computing deltas.
+                let release = snapped_point;
+                let gesture = program.with_tool_state(|ts| {
+                    let mut g = std::mem::take(&mut ts.drag_move);
+                    if g.active {
+                        g.current = release;
+                    }
+                    g
                 });
-                let selected_ids = selected_regions(program);
-                if let (Some((id, grab_x, grab_y)), Some(transform)) = (held, state.transform.clone()) {
-                    if let Some(end) = transform.screen_to_data(screen) {
-                        // Edge grab → resize instead of move
-                        if let Some(edge) = edge {
-                            let mut targets: Vec<crate::region::RegionId> = vec![id];
-                            for sid in &selected_ids {
-                                if *sid != id {
-                                    targets.push(*sid);
-                                }
-                            }
-                            for target in targets {
-                                program.emit_tool_event(ToolEvent::ResizeRegion {
-                                    region: target,
-                                    edge,
-                                    time: end.x,
-                                });
-                            }
-                            return;
-                        }
-                        let dy = (end.y - grab_y).round().clamp(-64.0, 64.0) as i64;
-                        // Group edit: emit for the grabbed region AND all
-                        // regions selected by box-select.
-                        let mut targets: Vec<crate::region::RegionId> = vec![id];
-                        for sid in &selected_ids {
-                            if *sid != id {
-                                targets.push(*sid);
-                            }
-                        }
-                        for target in targets {
-                            program.emit_tool_event(ToolEvent::MoveRegion {
-                                region: target,
-                                dt: end.x - grab_x,
-                                dy: dy as i8,
-                            });
-                        }
+                let Some(primary_id) = gesture.primary else {
+                    return;
+                };
+                if !gesture.active {
+                    return;
+                }
+                let dx = gesture.dx();
+                let dy = gesture.dy();
+                if dx.abs() < 1e-9 && dy.abs() < 1e-9 {
+                    return; // click without drag → nothing
+                }
+                // Resolve the gesture back to live regions.
+                let targets: Vec<crate::region::DataRegion> = gesture
+                    .targets
+                    .iter()
+                    .filter_map(|(id, _, _)| {
+                        program.plot().regions().iter().find(|r| r.id == *id).cloned()
+                    })
+                    .collect();
+                let tick_of = |seconds: f64| -> u64 {
+                    let tpb = program.ticks_per_beat().max(1) as f64;
+                    (seconds * tpb * 2.0).round().max(0.0) as u64
+                };
+                // Model indices live in the region metadata (`note_index`),
+                // written by the host when it mirrors its model into regions.
+                let model_indices: Vec<usize> = targets
+                    .iter()
+                    .filter_map(|r| {
+                        r.metadata
+                            .get("note_index")
+                            .and_then(|v| v.as_u64())
+                            .map(|i| i as usize)
+                    })
+                    .collect();
+                if model_indices.is_empty() {
+                    let _ = primary_id;
+                    return; // not a MIDI region — nothing to edit
+                }
+                let targets = NoteTargets { indices: model_indices };
+                match gesture.edge {
+                    Some(edge) => {
+                        // Group resize: the same absolute edge time for all.
+                        let tick = tick_of(gesture.current.x);
+                        program.emit_tool_event(ToolEvent::Midi(MidiEdit::Resize {
+                            targets,
+                            edge,
+                            tick,
+                        }));
+                    }
+                    None => {
+                        // Move: the same tick/pitch delta for the whole group.
+                        let dt_ticks = if dx < 0.0 {
+                            -(tick_of(-dx) as i64)
+                        } else {
+                            tick_of(dx) as i64
+                        };
+                        let dy_semi = dy.round().clamp(-127.0, 127.0) as i8;
+                        program.emit_tool_event(ToolEvent::Midi(MidiEdit::Move {
+                            targets,
+                            dt_ticks,
+                            dy_semitones: dy_semi,
+                        }));
                     }
                 }
             }
-            ToolPhase::Move => {}
-        }
-        return;
-    }
-
-    // ---- RESIZE: dedicated edge-drag (Scale = start edge, Stretch = end edge).
-    // Applies to the grabbed region and all box-selected regions (group edit).
-    if tool == Tool::Scale || tool == Tool::Stretch {
-        let edge = if tool == Tool::Scale { ResizeEdge::Start } else { ResizeEdge::End };
-        match phase {
-            ToolPhase::Down => {
-                let region = region_at(program, &transform, snapped_point);
-                program.with_tool_state(|ts| {
-                    ts.move_gesture = region.map(|r| (r.id, snapped_point.x, snapped_point.y));
-                    ts.gesture = ToolGesture::Drag {
-                        start: snapped_point,
-                        start_screen: screen,
-                        current: snapped_point,
-                        current_screen: screen,
-                    };
-                });
-            }
-            ToolPhase::Up => {
-                let held = program.with_tool_state(|ts| {
-                    let held = ts.move_gesture.take();
-                    ts.gesture = ToolGesture::None;
-                    held
-                });
-                let selected_ids = selected_regions(program);
-                if let (Some((id, _, _)), Some(transform)) = (held, state.transform.clone()) {
-                    if let Some(end) = transform.screen_to_data(screen) {
-                        let mut targets: Vec<crate::region::RegionId> = vec![id];
-                        for sid in &selected_ids {
-                            if *sid != id {
-                                targets.push(*sid);
-                            }
-                        }
-                        for target in targets {
-                            program.emit_tool_event(ToolEvent::ResizeRegion {
-                                region: target,
-                                edge,
-                                time: end.x,
-                            });
-                        }
-                    }
-                }
-            }
-            ToolPhase::Move => {}
         }
         return;
     }
@@ -913,10 +916,36 @@ fn finish_tool_gesture(
                 emit_domain_pen(program, position);
             }
         }
+        
         Tool::Eraser => {
             if let ToolGesture::Click { position, .. } =
                 std::mem::replace(&mut ts.gesture, ToolGesture::None)
             {
+                // Erase the clicked region; if it belongs to the box selection
+                // the WHOLE selection is erased (DAW behaviour).
+                if let Some(region) = region_at(program, transform, position) {
+                    let mut targets: Vec<crate::region::DataRegion> = vec![region.clone()];
+                    for r in program.plot().regions().iter() {
+                        if r.selected && r.id != region.id {
+                            targets.push(r.clone());
+                        }
+                    }
+                    let indices: Vec<usize> = targets
+                        .iter()
+                        .filter_map(|r| {
+                            r.metadata
+                                .get("note_index")
+                                .and_then(|v| v.as_u64())
+                                .map(|i| i as usize)
+                        })
+                        .collect();
+                    if !indices.is_empty() {
+                        program.emit_tool_event(ToolEvent::Midi(MidiEdit::Delete {
+                            targets: NoteTargets { indices },
+                        }));
+                        return;
+                    }
+                }
                 erase_at(program, transform, position);
             }
         }
@@ -925,6 +954,31 @@ fn finish_tool_gesture(
                 std::mem::replace(&mut ts.gesture, ToolGesture::None)
             {
                 if let Some(region) = region_at(program, transform, position) {
+                    // Split the clicked note, or every selected one.
+                    let mut targets: Vec<crate::region::DataRegion> = vec![region.clone()];
+                    for r in program.plot().regions().iter() {
+                        if r.selected && r.id != region.id {
+                            targets.push(r.clone());
+                        }
+                    }
+                    let indices: Vec<usize> = targets
+                        .iter()
+                        .filter_map(|r| {
+                            r.metadata
+                                .get("note_index")
+                                .and_then(|v| v.as_u64())
+                                .map(|i| i as usize)
+                        })
+                        .collect();
+                    if !indices.is_empty() {
+                        let tpb = program.ticks_per_beat().max(1) as f64;
+                        let tick = (position.x * tpb * 2.0).round().max(0.0) as u64;
+                        program.emit_tool_event(ToolEvent::Midi(MidiEdit::Split {
+                            targets: NoteTargets { indices },
+                            tick,
+                        }));
+                        return;
+                    }
                     program.emit_tool_event(ToolEvent::SplitRegion {
                         region: region.id,
                         time: position.x,
