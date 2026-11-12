@@ -1,7 +1,9 @@
 use std::collections::HashMap;
-use std::time::Instant;
 
+//use iced::time::Instant;
 use iced::mouse::Button;
+//use iced::mouse::Click;
+use iced::advanced::mouse::Click;
 
 use crate::axis::AxisLayoutCache;
 use crate::datasource::DecimationScratch;
@@ -53,7 +55,7 @@ pub(crate) struct ClickState {
 pub(crate) struct PinToggle {
     pub(crate) pin: Pin,
     pub(crate) added: bool,
-    pub(crate) at: Instant,
+   // pub(crate) at: Instant,
     pub(crate) screen_pos: ScreenPoint,
 }
 
@@ -64,24 +66,6 @@ pub(crate) struct HoverTarget {
     pub(crate) is_pinned: bool,
 }
 
-/// Simple click tracking for double-click detection
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct LastClick {
-    pub(crate) position: ScreenPoint,
-    pub(crate) button: Button,
-    pub(crate) time: Instant,
-}
-
-impl LastClick {
-    pub(crate) fn is_double_click(&self, position: ScreenPoint, button: Button, now: Instant) -> bool {
-        if self.button != button {
-            return false;
-        }
-        let distance = ((self.position.x - position.x).powi(2) + (self.position.y - position.y).powi(2)).sqrt();
-        let time_diff = now - self.time;
-        distance <= 6.0 && time_diff.as_millis() <= 300
-    }
-}
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SeriesCache {
@@ -112,12 +96,14 @@ pub struct PlotUiState {
     pub(crate) drag: Option<DragState>,
     pub(crate) pending_click: Option<ClickState>,
     pub(crate) last_pin_toggle: Option<PinToggle>,
+    pub(crate) ignore_next_release: bool, // <-- HIER ERGÄNZEN
     pub(crate) hover_target: Option<HoverTarget>,
     pub(crate) selection_rect: Option<ScreenRect>,
     pub(crate) hover: Option<ScreenPoint>,
     pub(crate) last_cursor: Option<ScreenPoint>,
     /// Previous click for double-click detection
-    pub(crate) last_click: Option<LastClick>,
+    pub(crate) last_click: Option<Click>,
+    //pub(crate) last_click: Option<LastClick>,
     pub(crate) linked_cursor_x: Option<f64>,
     pub(crate) linked_brush_x: Option<Range>,
     pub(crate) link_view_seq: u64,
@@ -149,6 +135,7 @@ impl Default for PlotUiState {
             drag: None,
             pending_click: None,
             last_pin_toggle: None,
+            ignore_next_release: false,
             hover_target: None,
             selection_rect: None,
             hover: None,

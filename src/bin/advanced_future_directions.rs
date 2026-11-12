@@ -40,7 +40,7 @@ use iced::{
     keyboard::{Key, Modifiers},
 };
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use iced::time::{Duration, Instant};
 
 // ============================================================================
 // APP STATE
@@ -379,6 +379,7 @@ impl AdvancedApp {
                     buf.push(ToolLog::Message(msg));
                     true
                 }
+                  ToolEvent::Midi(_) => todo!()
             }
         }));
 

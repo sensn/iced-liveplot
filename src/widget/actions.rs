@@ -10,10 +10,10 @@ use crate::plot::Plot;
 use crate::series::SeriesId;
 use crate::transform::Transform;
 use crate::view::{Range, Viewport};
-use crate::widget::state::{LastClick, PinToggle, PlotUiState};
+use crate::widget::state::{ PinToggle, PlotUiState};
 use crate::widget::config::PlotViewConfig;
 use std::collections::HashMap;
-use std::time::Instant;
+use iced::time::Instant;
 use std::sync::Arc;
 
 /// Error type for action execution.
